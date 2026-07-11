@@ -110,9 +110,14 @@ async def list_tools() -> list[Tool]:
                     },
                     "text": {"type": "string", "description": "Memory text (add/edit) or search query (search)"},
                     "memory_id": {"type": "string", "description": "Memory ID (edit/delete)"},
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Facet tags for add, or a single-tag filter for list. Optional — omit to let the memory tagger pick tags automatically.",
+                    },
                     "category": {
                         "type": "string",
-                        "description": "Memory tag, e.g. fact, contact, preference (add/list filter)",
+                        "description": "Deprecated alias for a single tag (add/list filter); prefer 'tags'.",
                     },
                 },
                 "required": ["action"],
@@ -139,7 +144,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     action = arguments.get("action", "")
 
     if action == "list":
-        tag_filter = normalize_tag(arguments.get("category", ""))
+        tags_arg = arguments.get("tags")
+        filter_raw = tags_arg[0] if isinstance(tags_arg, list) and tags_arg else arguments.get("category", "")
+        tag_filter = normalize_tag(filter_raw)
         _owner, _all_memories, memories, scope_error = _scope_entries()
         if scope_error:
             return _text_result(scope_error)
@@ -162,13 +169,23 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
     elif action == "add":
         text = arguments.get("text", "")
-        category = arguments.get("category", "fact")
+        tags_arg = arguments.get("tags")
+        explicit_tags = [str(t) for t in tags_arg] if isinstance(tags_arg, list) and tags_arg else None
+        if explicit_tags is None and arguments.get("category"):
+            explicit_tags = [str(arguments["category"])]
         if not text:
             return _text_result("Error: Memory text cannot be empty")
         owner, memories, _visible, scope_error = _scope_entries()
         if scope_error:
             return _text_result(scope_error)
-        entry = _memory_manager.add_entry(text, source="ai_agent", category=category, owner=owner)
+        entry = _memory_manager.add_entry(text, source="ai_agent", owner=owner)
+        # interactive=True: this MCP call is the synchronous tail of a chat/
+        # agent tool call blocking on our reply — even though this subprocess
+        # has no interactive_gate state of its own to deadlock against, treat
+        # it the same as the other inline write paths for consistency.
+        from services.memory.memory_tagger import tag_memory, apply_tags
+        tag_result = await tag_memory(text, owner=owner, interactive=True)
+        apply_tags(entry, tag_result, user_tags=explicit_tags)
         with _memory_manager.lock:
             memories.append(entry)
             _memory_manager.save(memories)

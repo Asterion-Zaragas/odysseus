@@ -703,9 +703,15 @@ def _raw_openai_tool_call_to_block(value) -> Optional[ToolBlock]:
                 content += "\n" + args["value"]
     elif tool_type == "manage_memory":
         action = args.get("action", "")
+        # `tags` (array) is the current param; `category` (single legacy tag)
+        # is kept as a fallback for models still emitting the old schema.
+        tags_val = args.get("tags")
+        tags_line = ",".join(str(t) for t in tags_val) if isinstance(tags_val, list) and tags_val else None
         if action == "add":
             content = "add\n" + str(args.get("text", ""))
-            if args.get("category"):
+            if tags_line:
+                content += "\n" + tags_line
+            elif args.get("category"):
                 content += "\n" + str(args["category"])
         elif action == "edit":
             content = "edit\n" + str(args.get("memory_id", "")) + "\n" + str(args.get("text", ""))
@@ -714,7 +720,11 @@ def _raw_openai_tool_call_to_block(value) -> Optional[ToolBlock]:
         elif action == "search":
             content = "search\n" + str(args.get("text", ""))
         elif action == "list":
-            content = "list" + (("\n" + str(args["category"])) if args.get("category") else "")
+            # do_manage_memory's "list" only supports a single filter tag —
+            # take the first of the array rather than joining them.
+            first_tag = str(tags_val[0]) if isinstance(tags_val, list) and tags_val else None
+            filter_val = first_tag or (str(args["category"]) if args.get("category") else "")
+            content = "list" + (("\n" + filter_val) if filter_val else "")
         else:
             content = action
     elif tool_type == "ui_control":

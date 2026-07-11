@@ -295,6 +295,7 @@ async def extract_and_store(
 
     try:
         from src.llm_core import llm_call_async
+        from services.memory.memory_tagger import tag_memory, apply_tags
 
         # Get last N messages from session
         messages = session.get_context_messages()
@@ -444,6 +445,8 @@ async def extract_and_store(
                 continue
 
             entry = memory_manager.add_entry(fact_text, source="auto", category=category, owner=_owner)
+            tag_result = await tag_memory(fact_text, owner=_owner)
+            apply_tags(entry, tag_result)
             # Auto-pin identity facts (name, job, location) — core context.
             # Goes away with the distiller upgrade: generality → tier 0 takes over.
             if "identity" in entry["tags"]:

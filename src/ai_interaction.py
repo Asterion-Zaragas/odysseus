@@ -343,12 +343,14 @@ async def do_manage_memory(content: str, session_id: Optional[str] = None, owner
 
     Actions:
       list                    — list all memories (optional line 2: tag filter)
-      add                     — line 2: text, optional line 3: tag (e.g. fact, contact, preference)
+      add                     — line 2: text, optional line 3: tags (comma-separated,
+                                 e.g. "work,person:sven"; a single word works too).
+                                 Omit line 3 to let the memory tagger pick tags.
       edit                    — line 2: memory_id, line 3: new text
       delete                  — line 2: memory_id
       search                  — line 2: query
     """
-    from src.memory import normalize_tag
+    from src.memory import normalize_tag, normalize_tags
 
     if not _memory_manager:
         return {"error": "Memory manager not available"}
@@ -384,11 +386,17 @@ async def do_manage_memory(content: str, session_id: Optional[str] = None, owner
         if len(lines) < 2:
             return {"error": "Add needs line 2: memory text"}
         text = lines[1].strip()
-        category = lines[2].strip().lower() if len(lines) > 2 and lines[2].strip() else "fact"
+        explicit_tags = normalize_tags(lines[2].split(",")) if len(lines) > 2 and lines[2].strip() else None
         if not text:
             return {"error": "Memory text cannot be empty"}
 
-        entry = _memory_manager.add_entry(text, source="ai_agent", category=category, owner=owner)
+        entry = _memory_manager.add_entry(text, source="ai_agent", owner=owner)
+        # interactive=True: this tool call runs inline inside the chat/agent
+        # request's own tracked HTTP handling — waiting on interactive_gate's
+        # foreground-quiet check here would deadlock the request against itself.
+        from services.memory.memory_tagger import tag_memory, apply_tags
+        tag_result = await tag_memory(text, owner=owner, interactive=True)
+        apply_tags(entry, tag_result, user_tags=explicit_tags)
         with _memory_manager.lock:
             memories = _memory_manager.load_all()
             memories.append(entry)

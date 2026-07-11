@@ -333,9 +333,17 @@ class ChatHandler:
             message
         )
         if is_memory_cmd and memory_text:
+            owner = getattr(session, "owner", None)
             mem = self.memory_manager.load()
             if not self.memory_manager.find_duplicates(memory_text, mem):
-                new_entry = self.memory_manager.add_entry(memory_text)
+                new_entry = self.memory_manager.add_entry(memory_text, owner=owner)
+                # interactive=True: this runs inline inside the chat request's
+                # own HTTP handling, which interactive_gate already counts as
+                # active foreground traffic — waiting on it here would deadlock
+                # the request against itself (src/task_endpoint.py).
+                from services.memory.memory_tagger import tag_memory, apply_tags
+                tag_result = await tag_memory(memory_text, owner=owner, interactive=True)
+                apply_tags(new_entry, tag_result)
                 mem.append(new_entry)
                 self.memory_manager.save(mem)
 

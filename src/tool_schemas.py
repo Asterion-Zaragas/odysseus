@@ -444,8 +444,10 @@ FUNCTION_TOOL_SCHEMAS = [
                                "description": "The action to perform"},
                     "text": {"type": "string", "description": "Memory text (for add/edit) or search query (for search)"},
                     "memory_id": {"type": "string", "description": "Memory ID (for edit/delete)"},
+                    "tags": {"type": "array", "items": {"type": "string"},
+                              "description": "Facet tags for add (e.g. [\"work\", \"person:sven\"]) or a single-tag filter for list. Optional — omit to let the memory tagger pick tags automatically."},
                     "category": {"type": "string",
-                                 "description": "Memory tag, e.g. fact, contact, preference (for add/list filter)"}
+                                 "description": "Deprecated alias for a single tag (for add/list filter); prefer 'tags'."}
                 },
                 "required": ["action"]
             }

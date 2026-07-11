@@ -138,6 +138,12 @@ def setup_memory_routes(memory_manager: MemoryManager, session_manager: SessionM
         )
         if memory_data.session_id:
             new_entry["session_id"] = memory_data.session_id
+        # interactive=True: this route runs inline inside its own tracked HTTP
+        # request, so waiting on interactive_gate's foreground-quiet check here
+        # would deadlock the request against itself.
+        from services.memory.memory_tagger import tag_memory, apply_tags
+        tag_result = await tag_memory(text, owner=user, interactive=True)
+        apply_tags(new_entry, tag_result, user_tags=memory_data.tags)
         with memory_manager.lock:
             all_mem = memory_manager.load_all()
             all_mem.append(new_entry)
@@ -548,41 +554,60 @@ def setup_memory_routes(memory_manager: MemoryManager, session_manager: SessionM
         raise HTTPException(404, "Memory not found")
 
     @router.put("/{memory_id}")
-    def update_memory(request: Request, memory_id: str, text: str = Form(...),
+    async def update_memory(request: Request, memory_id: str, text: str = Form(...),
                       tags: str = Form(None), category: str = Form(None)):
         """Update an existing memory item with new text and optional tags.
 
-        `tags` (JSON array or comma-separated) replaces the tag list.
-        `category` is the legacy alias: it swaps the first tag (which is the
-        migrated category) and keeps the rest.
+        `tags` (JSON array or comma-separated) replaces the tag list — the
+        tagger is still called for a fresh generality/tier, but its own tag
+        proposals are dropped in favor of the explicit list. `category` is
+        the legacy alias: it swaps the first tag (which is the migrated
+        category) and keeps the rest, then the tagger fills in the remainder.
+        Neither given: the tagger re-tags from the new text and merges into
+        the existing tags (nothing is dropped on a tagger failure).
         """
         user = _owner(request)
+        explicit_tags: Optional[List[str]] = None
         with memory_manager.lock:
             all_mem = memory_manager.load_all()
-            for i, memory in enumerate(all_mem):
-                if memory["id"] == memory_id:
-                    _verify_memory_owner(memory, user)
-                    all_mem[i]["text"] = text.strip()
-                    if tags is not None:
-                        try:
-                            parsed = json.loads(tags)
-                            tag_list = parsed if isinstance(parsed, list) else [tags]
-                        except json.JSONDecodeError:
-                            tag_list = tags.split(",")
-                        all_mem[i]["tags"] = normalize_tags(tag_list)
-                    elif category:
-                        rest = (memory.get("tags") or [])[1:]
-                        all_mem[i]["tags"] = normalize_tags([category] + rest)
-                    all_mem[i]["timestamp"] = int(time.time())
+            target = next((m for m in all_mem if m["id"] == memory_id), None)
+            if not target:
+                raise HTTPException(404, f"Memory item {memory_id} not found")
+            _verify_memory_owner(target, user)
 
-                    memory_manager.save(all_mem)
-                    # Sync vector index (remove old, add updated)
-                    if memory_vector and memory_vector.healthy:
-                        memory_vector.remove(memory_id)
-                        memory_vector.add(memory_id, text.strip())
-                    return {"ok": True, "message": "Memory updated successfully"}
+            new_text = text.strip()
+            target["text"] = new_text
+            if tags is not None:
+                try:
+                    parsed = json.loads(tags)
+                    tag_list = parsed if isinstance(parsed, list) else [tags]
+                except json.JSONDecodeError:
+                    tag_list = tags.split(",")
+                explicit_tags = normalize_tags(tag_list)
+                target["tags"] = explicit_tags
+            elif category:
+                rest = (target.get("tags") or [])[1:]
+                target["tags"] = normalize_tags([category] + rest)
+            target["timestamp"] = int(time.time())
+            memory_manager.save(all_mem)
 
-        raise HTTPException(404, f"Memory item {memory_id} not found")
+        # interactive=True: this route runs inline inside its own tracked HTTP
+        # request, so waiting on interactive_gate's foreground-quiet check here
+        # would deadlock the request against itself.
+        from services.memory.memory_tagger import tag_memory, apply_tags
+        tag_result = await tag_memory(new_text, owner=user, interactive=True)
+        with memory_manager.lock:
+            all_mem = memory_manager.load_all()
+            target = next((m for m in all_mem if m["id"] == memory_id), None)
+            if target:
+                apply_tags(target, tag_result, user_tags=explicit_tags)
+                memory_manager.save(all_mem)
+
+        # Sync vector index (remove old, add updated)
+        if memory_vector and memory_vector.healthy:
+            memory_vector.remove(memory_id)
+            memory_vector.add(memory_id, new_text)
+        return {"ok": True, "message": "Memory updated successfully"}
 
     @router.delete("/{memory_id}")
     def delete_memory(request: Request, memory_id: str):
