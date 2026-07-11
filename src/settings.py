@@ -152,6 +152,33 @@ DEFAULT_SETTINGS = {
     # Ordered fallback chain for the Utility model (summarization, naming,
     # tidy actions, etc.).
     "utility_model_fallbacks": [],
+    # Memory-system model roles (memory upgrade plan). "fast" serves the
+    # tagger / facet-extractor / verifier (small, called on hot paths);
+    # "smart" serves the distiller (extraction) / curator (nightly).
+    # Both fall back through the shared task->utility->default chain when
+    # unset — see src/task_endpoint.py:resolve_memory_candidates.
+    "memory_fast_endpoint_id": "",
+    "memory_fast_model": "",
+    "memory_smart_endpoint_id": "",
+    "memory_smart_model": "",
+    # Max tags kept in the curator-maintained tag registry (data/memory_context/);
+    # lowest-count tags get merged when the cap is exceeded.
+    "memory_tag_registry_cap": 50,
+    "memory_curator_nightly": True,
+    # Local hour (0-23) the nightly curator loop targets, mirrors the skill-audit loop.
+    "memory_curator_hour": 3,
+    # Max entries per curator LLM sub-pass batch (never the whole store at once).
+    "memory_curator_batch": 25,
+    # Default retrieval effort ("low" | "medium" | "high"); per-turn UI selector overrides it.
+    "memory_retrieval_effort": "medium",
+    # Whether the per-owner memory context document is injected into chat by default;
+    # UI-toggled per turn like web search.
+    "memory_context_doc_injection": False,
+    # Archive-tier entries idle (by last_used_at) longer than this and with low
+    # usage are expiry candidates for the curator; protected/pinned are immune.
+    "memory_archive_expiry_days": 90,
+    # Comma-separated tags the curator may never delete/expire (still mergeable/renameable).
+    "memory_protected_tags": "contact,identity",
     "teacher_model": "",
     "teacher_enabled": False,
     "teacher_tier2_enabled": False,
@@ -273,6 +300,8 @@ _PER_USER_KEYS = {
     "default_endpoint_id", "default_model", "default_model_fallbacks",
     "utility_endpoint_id", "utility_model", "utility_model_fallbacks",
     "research_endpoint_id", "research_model",
+    "memory_fast_endpoint_id", "memory_fast_model",
+    "memory_smart_endpoint_id", "memory_smart_model",
 }
 
 

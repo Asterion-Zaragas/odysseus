@@ -76,3 +76,63 @@ async def task_llm_call_async(
     await wait_for_interactive_quiet("background task LLM")
     kwargs.setdefault("workload", "background")
     return await llm_call_async_with_fallback(candidates, messages=messages, **kwargs)
+
+
+# Memory-system model roles (memory upgrade plan, Part "Model classes per
+# agent"): "fast" serves the tagger/facet-extractor/verifier, "smart" serves
+# the distiller/curator. Both resolve through the generic `resolve_endpoint`
+# prefix support, falling back to the same task->utility->default chain as
+# everything else in this module when unconfigured.
+MEMORY_ROLES = ("fast", "smart")
+
+
+def resolve_memory_candidates(role, owner=None):
+    """Return ordered LLM candidates for a memory-system agent role.
+
+    Order:
+    1. configured `memory_{role}_endpoint_id` / `memory_{role}_model`
+    2. the background-task candidate chain (resolve_task_candidates)
+    """
+    if role not in MEMORY_ROLES:
+        raise ValueError(f"unknown memory role: {role!r}")
+
+    candidates = []
+
+    def _append(url, model, headers):
+        if not url or not model:
+            return
+        key = (url, model)
+        if any((u, m) == key for u, m, _ in candidates):
+            return
+        candidates.append((url, model, headers or {}))
+
+    _append(*resolve_endpoint(f"memory_{role}", owner=owner))
+    for url, model, headers in resolve_task_candidates(owner=owner):
+        _append(url, model, headers)
+
+    return candidates
+
+
+async def memory_llm_call_async(
+    role,
+    messages,
+    *,
+    interactive=False,
+    owner=None,
+    **kwargs,
+):
+    """Call the shared candidate chain for a memory-system agent role.
+
+    `interactive=True` skips the background-task foreground gate. Only the
+    retrieval hot path (Phase 6) should pass it: that call happens inline in
+    a chat turn, so it must not queue behind the same "UI is busy" window it
+    is itself part of. Every other memory role (tagger, curator, distiller)
+    runs off the interactive path and keeps the gate.
+    """
+    candidates = resolve_memory_candidates(role, owner=owner)
+    if not candidates:
+        raise RuntimeError(f"No LLM endpoint available for memory {role} task")
+    if not interactive:
+        await wait_for_interactive_quiet(f"memory {role} task")
+    kwargs.setdefault("workload", "background")
+    return await llm_call_async_with_fallback(candidates, messages=messages, **kwargs)

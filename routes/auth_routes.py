@@ -655,6 +655,10 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
         _INT_RANGES = {
             "agent_max_rounds": (1, 200),
             "agent_max_tool_calls": (0, 1000),  # 0 = unlimited
+            "memory_tag_registry_cap": (5, 500),
+            "memory_curator_hour": (0, 23),
+            "memory_curator_batch": (1, 200),
+            "memory_archive_expiry_days": (1, 3650),
         }
         for key in DEFAULT_SETTINGS:
             if key not in body:

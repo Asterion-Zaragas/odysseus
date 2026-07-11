@@ -639,6 +639,127 @@ async function initUtilityModel() {
   });
 }
 
+/* ── Memory Models (fast / smart roles) ──
+   Both fall back to Utility -> Default Chat when unset, same as every other
+   background-task role (src/task_endpoint.py: resolve_memory_candidates). */
+async function initMemoryModelSettings() {
+  var roles = [
+    { role: 'fast', epSel: el('set-memoryFastEpSelect'), modelSel: el('set-memoryFastModelSelect') },
+    { role: 'smart', epSel: el('set-memorySmartEpSelect'), modelSel: el('set-memorySmartModelSelect') },
+  ];
+  var msg = el('set-memoryModelsMsg');
+  if (!roles[0].epSel || !roles[1].epSel) return;
+  var _endpoints = [];
+
+  roles.forEach(function(r) {
+    if (r.epSel.options[0]) r.epSel.options[0].textContent = 'Same as Utility';
+    if (r.modelSel.options[0]) r.modelSel.options[0].textContent = 'Same as Utility';
+  });
+
+  try {
+    _endpoints = await _fetchModelEndpoints();
+    roles.forEach(function(r) { _fillEndpointSelect(r.epSel, _endpoints, r.epSel.value, true); });
+  } catch (e) { console.warn('Failed to load endpoints for memory models', e); }
+
+  function refreshModels(r, selectedModel) {
+    var ep = _endpoints.find(function(e) { return e.id === r.epSel.value; });
+    _fillModelSelect(r.modelSel, ep ? ep.models : [], selectedModel, true);
+  }
+
+  try {
+    var res = await fetch('/api/auth/settings', { credentials: 'same-origin' });
+    var settings = await res.json();
+    roles.forEach(function(r) {
+      var epKey = 'memory_' + r.role + '_endpoint_id';
+      var modelKey = 'memory_' + r.role + '_model';
+      if (settings[epKey]) r.epSel.value = settings[epKey];
+      refreshModels(r, settings[modelKey] || '');
+    });
+  } catch (e) { console.warn('Failed to load memory model settings', e); }
+
+  async function saveMemoryModels() {
+    try {
+      var payload = {};
+      roles.forEach(function(r) {
+        payload['memory_' + r.role + '_endpoint_id'] = r.epSel.value || '';
+        payload['memory_' + r.role + '_model'] = r.modelSel.value || '';
+      });
+      await fetch('/api/auth/settings', { method: 'POST', credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      msg.textContent = 'Saved'; msg.style.color = 'var(--fg)';
+      setTimeout(function() { msg.textContent = ''; }, 1500);
+    } catch (e) { msg.textContent = 'Failed to save'; msg.style.color = 'var(--red)'; }
+  }
+
+  roles.forEach(function(r) {
+    r.epSel.addEventListener('change', function() { refreshModels(r, ''); saveMemoryModels(); });
+    r.modelSel.addEventListener('change', saveMemoryModels);
+  });
+
+  _registerAiEndpointRefresh(function(endpoints) {
+    _endpoints = endpoints;
+    roles.forEach(function(r) {
+      _fillEndpointSelect(r.epSel, _endpoints, r.epSel.value, true);
+      refreshModels(r, r.modelSel.value);
+    });
+  });
+}
+
+/* ── Memory System (registry cap, curator schedule, retrieval defaults) ── */
+async function initMemorySystemSettings() {
+  var nightlyToggle = el('set-memoryCuratorNightlyToggle');
+  var registryCapInput = el('set-memoryRegistryCap');
+  var curatorHourInput = el('set-memoryCuratorHour');
+  var curatorBatchInput = el('set-memoryCuratorBatch');
+  var effortSelect = el('set-memoryRetrievalEffort');
+  var contextDocToggle = el('set-memoryContextDocToggle');
+  var expiryDaysInput = el('set-memoryExpiryDays');
+  var protectedTagsInput = el('set-memoryProtectedTags');
+  var msg = el('set-memorySystemMsg');
+  if (!registryCapInput) return;
+
+  try {
+    var res = await fetch('/api/auth/settings', { credentials: 'same-origin' });
+    var settings = await res.json();
+    if (nightlyToggle) nightlyToggle.checked = settings.memory_curator_nightly !== false;
+    if (settings.memory_tag_registry_cap != null) registryCapInput.value = settings.memory_tag_registry_cap;
+    if (settings.memory_curator_hour != null) curatorHourInput.value = settings.memory_curator_hour;
+    if (settings.memory_curator_batch != null) curatorBatchInput.value = settings.memory_curator_batch;
+    if (effortSelect && settings.memory_retrieval_effort) effortSelect.value = settings.memory_retrieval_effort;
+    if (contextDocToggle) contextDocToggle.checked = !!settings.memory_context_doc_injection;
+    if (settings.memory_archive_expiry_days != null) expiryDaysInput.value = settings.memory_archive_expiry_days;
+    if (settings.memory_protected_tags != null) protectedTagsInput.value = settings.memory_protected_tags;
+  } catch (e) { console.warn('Failed to load memory system settings', e); }
+
+  async function saveMemorySystem() {
+    var payload = { memory_curator_nightly: nightlyToggle ? nightlyToggle.checked : true };
+    var cap = parseInt(registryCapInput.value, 10);
+    if (!isNaN(cap)) payload.memory_tag_registry_cap = cap;
+    var hour = parseInt(curatorHourInput.value, 10);
+    if (!isNaN(hour)) payload.memory_curator_hour = hour;
+    var batch = parseInt(curatorBatchInput.value, 10);
+    if (!isNaN(batch)) payload.memory_curator_batch = batch;
+    if (effortSelect) payload.memory_retrieval_effort = effortSelect.value;
+    if (contextDocToggle) payload.memory_context_doc_injection = contextDocToggle.checked;
+    var expiry = parseInt(expiryDaysInput.value, 10);
+    if (!isNaN(expiry)) payload.memory_archive_expiry_days = expiry;
+    payload.memory_protected_tags = protectedTagsInput.value || '';
+    try {
+      await fetch('/api/auth/settings', { method: 'POST', credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      msg.textContent = 'Saved'; msg.style.color = 'var(--fg)';
+      setTimeout(function() { msg.textContent = ''; }, 1500);
+    } catch (e) { msg.textContent = 'Failed to save'; msg.style.color = 'var(--red)'; }
+  }
+
+  [nightlyToggle, registryCapInput, curatorHourInput, curatorBatchInput, effortSelect, contextDocToggle, expiryDaysInput, protectedTagsInput]
+    .forEach(function(input) { if (input) input.addEventListener('change', saveMemorySystem); });
+}
+
 /* ── Teacher Model ── */
 // SOTA model called automatically when a self-hosted student model
 // fails an agent-mode task. Stored as a single `teacher_model` string
@@ -2327,6 +2448,8 @@ function initAll() {
   initDefaultChat();
   initTeacherModel();
   initUtilityModel();
+  initMemoryModelSettings();
+  initMemorySystemSettings();
   initImageSettings();
   initVisionSettings();
   initTtsSettings();
