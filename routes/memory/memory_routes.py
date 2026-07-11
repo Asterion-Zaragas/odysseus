@@ -27,7 +27,7 @@ from src.memory import compat_category, normalize_tags
 from src.request_models import MemoryAddRequest
 from core.database import SessionLocal
 from src.llm_core import llm_call_async
-from services.memory.memory_extractor import audit_memories
+from services.memory.memory_curator import curate, read_curation_log, undo_expire
 from src.auth_helpers import get_current_user, require_user
 from src.endpoint_resolver import resolve_endpoint
 from src.task_endpoint import resolve_task_endpoint
@@ -310,55 +310,49 @@ def setup_memory_routes(memory_manager: MemoryManager, session_manager: SessionM
             return {"suggestions": [item["text"] for item in fallback]}
 
     @router.post("/audit")
-    async def api_audit_memories(request: Request, session: str = Form(None)):
-        """Deduplicate and consolidate memories via LLM.
+    async def api_audit_memories(request: Request, dry_run: bool = Form(False)):
+        """Run the memory curator for the caller: dedupe/merge, tag
+        normalization, tier rescoring, archive expiry, and a context-doc
+        rebuild — batched, nightly-run's manual-trigger twin.
 
-        Uses task/utility/default settings through the shared resolver, with
-        the active session as fallback when no task or utility model is set.
-        Returns before and after memory counts.
+        Uses the "memory smart" model role (Settings -> AI Defaults ->
+        Memory Models), falling back through the background-task chain like
+        every other memory-system agent — no per-request model resolution
+        needed here anymore. `dry_run=true` runs the full pipeline and logs
+        proposed actions without writing anything back.
         """
         user = _owner(request)
-        fallback_url = fallback_model = None
-        fallback_headers = None
-        if session:
-            try:
-                sess = session_manager.get_session(session)
-                _assert_session_owner(sess, user)
-                fallback_url = sess.endpoint_url
-                fallback_model = sess.model
-                fallback_headers = sess.headers
-            except KeyError:
-                pass
-
-        endpoint_url, model, headers = resolve_task_endpoint(
-            fallback_url, fallback_model, fallback_headers, owner=user
-        )
-
-        if not endpoint_url or not model:
-            raise HTTPException(400, "No default model configured — set one in Settings")
-
-        result = await audit_memories(
-            memory_manager,
-            memory_vector,
-            endpoint_url,
-            model,
-            headers,
-            owner=user,
-        )
-
-        if "error" in result and "before" not in result:
-            raise HTTPException(502, f"Audit failed: {result['error']}")
+        result = await curate(memory_manager, memory_vector, owner=user, dry_run=dry_run)
 
         return {
-            "ok": "error" not in result,
+            "ok": True,
             "before": result.get("before", 0),
             "after": result.get("after", 0),
             "removed": result.get("before", 0) - result.get("after", 0),
-            # True when the audit skipped the LLM because nothing changed
-            # since the last tidy. Frontend already says "Already clean"
-            # for removed==0, so this is here for future use / debugging.
+            # True when the run skipped the LLM passes because nothing
+            # changed since the last curation. Frontend already says
+            # "Already clean" for removed==0, so this is here for future
+            # use / debugging.
             "already_tidy": bool(result.get("already_tidy")),
+            "dry_run": dry_run,
         }
+
+    @router.get("/curation-log")
+    def get_curation_log(request: Request, limit: int = 100):
+        """Recent curator changelog entries for the caller (merge/retag/
+        demote/promote/expire), most recent last."""
+        user = _owner(request)
+        return {"log": read_curation_log(user, limit=limit)}
+
+    @router.post("/curation-log/undo")
+    def undo_curation_action(request: Request, memory_id: str = Form(...)):
+        """Undo an `expire` action by re-inserting its changelog snapshot."""
+        from src.auth_helpers import require_privilege
+        require_privilege(request, "can_manage_memory")
+        user = _owner(request)
+        if not undo_expire(memory_manager, memory_vector, user, memory_id):
+            raise HTTPException(404, "No expired memory found with that id")
+        return {"ok": True}
 
     @router.post("/import")
     async def import_memories_from_file(

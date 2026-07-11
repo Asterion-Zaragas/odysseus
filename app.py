@@ -1235,6 +1235,42 @@ async def _startup_event():
 
     _startup_tasks.append(asyncio.create_task(_skill_audit_nightly_loop()))
 
+    # Nightly memory curator — per owner, dedupes/merges, normalizes tags,
+    # rescores tiers, expires stale archive entries, and rebuilds the
+    # per-owner memory context document (memory upgrade plan, Phase 4).
+    # Gated by `memory_curator_nightly` (default on); hour via
+    # `memory_curator_hour` (default 3). Each owner's run is independently
+    # checkpointed/fingerprint-gated (services/memory/memory_curator.py), so
+    # one slow or failing owner can't block the rest.
+    async def _memory_curator_nightly_loop():
+        from datetime import timedelta
+        while True:
+            try:
+                from src.settings import get_setting
+                hour = int(get_setting("memory_curator_hour", 3) or 3)
+            except Exception:
+                hour = 3
+            now = datetime.now()
+            nxt = now.replace(hour=hour % 24, minute=0, second=0, microsecond=0)
+            if nxt <= now:
+                nxt += timedelta(days=1)
+            await asyncio.sleep(max(60, (nxt - now).total_seconds()))
+            try:
+                from src.settings import get_setting
+                if not get_setting("memory_curator_nightly", True):
+                    continue
+                from services.memory.memory_curator import curate, list_owners
+                for owner in list_owners(memory_manager):
+                    try:
+                        result = await curate(memory_manager, memory_vector, owner=owner, dry_run=False)
+                        logger.info(f"Nightly memory curation for {owner or '(legacy)'}: {result}")
+                    except Exception as e:
+                        logger.warning(f"Nightly memory curation failed for {owner or '(legacy)'}: {e}")
+            except Exception as e:
+                logger.warning(f"Nightly memory curation loop failed: {e}")
+
+    _startup_tasks.append(asyncio.create_task(_memory_curator_nightly_loop()))
+
     # Cookbook serve lifecycle — kills scheduler-launched serves whose
     # window-end has passed. Paired with the cookbook_serve builtin
     # action; both are no-ops unless a scheduled task actually launches

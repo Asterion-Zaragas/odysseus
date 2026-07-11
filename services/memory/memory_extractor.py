@@ -6,27 +6,19 @@ After each LLM response, this module sends the last few messages to the LLM
 asking it to extract memorable facts, then stores them in both memory.json
 and the FAISS vector index.
 
-Periodically audits all memories via LLM to consolidate duplicates,
-rewrite vague entries, and remove junk.
+Full deduplication/consolidation, tag normalization, tier rescoring, and
+archive expiry are the nightly curator's job now (services/memory/
+memory_curator.py); this module only runs the cheap post-extraction triage
+trigger (see AUDIT_INTERVAL below).
 """
 
 import hashlib
 import json
 import logging
-import os
 import re
 from typing import Optional
 
 logger = logging.getLogger(__name__)
-
-
-def _tidy_state_path(memory_manager) -> str:
-    """Sidecar JSON next to memory.json that remembers the fingerprint of
-    the last successfully-audited state per owner. Lets the audit short-
-    circuit when nothing has changed since the previous tidy — running
-    the LLM again on an already-clean list was wasting 30-120s per call
-    and occasionally timing out on the second pass."""
-    return os.path.join(os.path.dirname(memory_manager.memory_file), "memory_tidy_state.json")
 
 
 def _fingerprint_entries(entries) -> str:
@@ -50,26 +42,6 @@ def _memory_dicts(entries):
             yield entry
 
 
-def _load_tidy_state(memory_manager) -> dict:
-    path = _tidy_state_path(memory_manager)
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-
-
-def _save_tidy_state(memory_manager, owner: Optional[str], fingerprint: str) -> None:
-    path = _tidy_state_path(memory_manager)
-    state = _load_tidy_state(memory_manager)
-    state[owner or ""] = {"fingerprint": fingerprint}
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(state, f, indent=2)
-    except OSError as e:
-        logger.warning(f"Could not persist tidy fingerprint: {e}")
-
 EXTRACT_SYSTEM_PROMPT = (
     "You are a memory extraction assistant. Analyze the conversation and extract ONLY "
     "durable personal facts about the user that would be useful across many future conversations.\n\n"
@@ -90,29 +62,7 @@ EXTRACT_SYSTEM_PROMPT = (
 # How many recent messages to include for extraction
 CONTEXT_WINDOW = 6
 
-AUDIT_SYSTEM_PROMPT = (
-    "You are a memory database curator. Be CONSERVATIVE: remove only TRUE "
-    "duplicates and clearly useless entries. Every distinct fact must survive. "
-    "When in doubt, KEEP the entry. Return the cleaned list.\n\n"
-    "Rules:\n"
-    "1. MERGE only entries that state the SAME fact in different words. If you "
-    "are not sure two entries are the same fact, KEEP BOTH.\n"
-    "   Merge: 'User's name is Sam' + 'The user is called Sam' -> one.\n"
-    "   Do NOT merge related-but-distinct facts: 'Likes Python' and 'Uses "
-    "Python at work' are DIFFERENT — keep both.\n"
-    "2. REMOVE only entries that are genuinely worthless: about what the AI did "
-    "(not the user), empty, or meaningless. Do NOT drop a real fact just "
-    "because it seems minor or niche.\n"
-    "3. Keep the original wording. Only lightly trim obvious redundancy — do "
-    "NOT aggressively rewrite or shorten.\n"
-    "4. Preserve the 'id' of the entry you keep when merging.\n"
-    "5. Never invent facts. When unsure, KEEP.\n"
-    "6. Keep each entry's 'tags' list unless merging (then union the tags).\n\n"
-    "Return a JSON array of objects with fields: id, text, tags.\n"
-    "Return ONLY valid JSON, no markdown fences."
-)
-
-AUDIT_INTERVAL = 5  # audit every N new memories added
+AUDIT_INTERVAL = 5  # run the cheap triage pass every N new memories added
 _extractions_since_audit = 0
 
 
@@ -490,195 +440,12 @@ async def extract_and_store(
             _extractions_since_audit += added
             if _extractions_since_audit >= AUDIT_INTERVAL:
                 _extractions_since_audit = 0
-                logger.info("Audit threshold reached, running memory audit")
-                await audit_memories(
-                    memory_manager, memory_vector, endpoint_url, model, headers, owner=_owner
-                )
+                logger.info("Triage threshold reached, running cheap memory triage")
+                from services.memory.memory_curator import triage_new_entries
+                await triage_new_entries(memory_manager, owner=_owner)
         else:
             logger.info("Auto memory extraction ran: 0 added")
 
     except Exception as e:
         logger.error(f"Memory extraction failed: {e}")
 
-
-async def audit_memories(
-    memory_manager,
-    memory_vector,
-    endpoint_url: str,
-    model: str,
-    headers: Optional[dict] = None,
-    owner: Optional[str] = None,
-):
-    """Send all memories to the LLM for deduplication and consolidation.
-
-    - Merges near-duplicate entries
-    - Rewrites vague entries to be concise
-    - Removes junk / non-personal entries
-    - Rebuilds the vector index afterwards
-
-    Safe to call manually or from the automatic trigger in extract_and_store.
-    Errors are logged, never raised.
-    """
-    try:
-        from src.llm_core import llm_call_async
-
-        existing = memory_manager.load(owner=owner)
-        if not existing:
-            logger.info("Memory audit: nothing to audit")
-            return {"before": 0, "after": 0}
-
-        before_count = len(existing)
-
-        # Skip the LLM call entirely when this exact set of memories was
-        # already audited — the previous tidy left them in a clean state
-        # and nothing has changed since. Returns instantly so the UI shows
-        # "Already clean" without spending 30-120s on a wasted LLM round.
-        # The fingerprint includes id+text+category; any add/edit/delete
-        # invalidates it and the audit runs normally.
-        current_fp = _fingerprint_entries(existing)
-        last_state = _load_tidy_state(memory_manager).get(owner or "") or {}
-        if last_state.get("fingerprint") == current_fp:
-            logger.info("Memory audit: state unchanged since last tidy — skipping LLM")
-            return {
-                "before": before_count,
-                "after": before_count,
-                "already_tidy": True,
-            }
-
-        # Build payload: list of {id, text, tags} for the LLM
-        memory_payload = [
-            {"id": m["id"], "text": m["text"], "tags": m.get("tags") or []}
-            for m in existing
-        ]
-
-        audit_messages = [
-            {"role": "system", "content": AUDIT_SYSTEM_PROMPT},
-            {"role": "user", "content": json.dumps(memory_payload, ensure_ascii=False)},
-        ]
-
-        raw = await llm_call_async(
-            endpoint_url,
-            model,
-            audit_messages,
-            temperature=0.1,
-            # 16384 (was 2000): the deduped list of all memories can be large,
-            # and a reasoning model spends tokens thinking first — 2000 truncated
-            # the JSON so it never parsed ("bad_json").
-            max_tokens=16384,
-            headers=headers,
-            # Bound the call so the Tidy whirlpool can't spin indefinitely on a
-            # slow/large generation.
-            timeout=120,
-        )
-
-        # Parse the JSON list, tolerating reasoning-model noise: <think> blocks,
-        # markdown fences, leading prose, and trailing commas.
-        import re as _re
-        text = (raw or "").strip()
-        text = _re.sub(r'<think(?:ing)?>[\s\S]*?</think(?:ing)?>', '', text, flags=_re.I).strip()
-
-        def _loads_list(s):
-            if not s:
-                return None
-            for cand in (s, _re.sub(r',(\s*[}\]])', r'\1', s)):
-                try:
-                    v = json.loads(cand)
-                    if isinstance(v, list):
-                        return v
-                except Exception:
-                    continue
-            return None
-
-        cleaned = _loads_list(text)
-        if cleaned is None:
-            _m = _re.search(r'```(?:json)?\s*\n?([\s\S]*?)```', text)
-            if _m:
-                cleaned = _loads_list(_m.group(1).strip())
-        if cleaned is None:
-            _a, _b = text.find('['), text.rfind(']')
-            if _a >= 0 and _b > _a:
-                cleaned = _loads_list(text[_a:_b + 1])
-        if cleaned is None:
-            logger.error(f"Memory audit returned non-JSON: {text[:300]}")
-            return {"before": before_count, "after": before_count, "error": "bad_json"}
-
-        # Build lookup of original entries by ID so we can preserve metadata
-        originals = {m["id"]: m for m in existing}
-
-        final_entries = []
-        for item in cleaned:
-            if not isinstance(item, dict):
-                continue
-            mid = item.get("id", "")
-            new_text = item.get("text", "").strip()
-            if not new_text:
-                continue
-
-            if mid in originals:
-                # Preserve original metadata, update text + tags
-                from src.memory import normalize_tags
-                entry = originals[mid].copy()
-                entry["text"] = new_text
-                returned_tags = item.get("tags")
-                if returned_tags is None and item.get("category"):
-                    # Model answered in the pre-tags shape
-                    returned_tags = [item["category"]]
-                if returned_tags:
-                    entry["tags"] = normalize_tags(returned_tags)
-            else:
-                # ID not found — skip to avoid inventing entries
-                logger.debug(f"Audit returned unknown id {mid}, skipping")
-                continue
-
-            final_entries.append(entry)
-
-        after_count = len(final_entries)
-
-        # Safety net against catastrophic over-deletion. A conservative tidy
-        # should never wipe out half the store in one pass — if the model
-        # returned far fewer entries than it was given (over-consolidation, a
-        # dropped/truncated list, or it ignored ids), treat it as a misfire and
-        # DON'T save. Better to no-op than to silently lose memories.
-        if before_count >= 8 and after_count < before_count * 0.5:
-            logger.warning(
-                f"Memory audit would cut {before_count} -> {after_count} "
-                f"(>50% removed) — refusing as unsafe, keeping originals"
-            )
-            return {"before": before_count, "after": before_count, "error": "unsafe_removal"}
-
-        # Merge audited entries back with other users' entries. Under the
-        # store lock: the reload + save must be one unit or a memory written
-        # during the (long) audit LLM call gets silently dropped.
-        with memory_manager.lock:
-            if owner:
-                all_entries = memory_manager.load_all()
-                audited_ids = {e["id"] for e in final_entries}
-                other_entries = [e for e in all_entries if e.get("owner") != owner and (e.get("owner") is not None)]
-                # Also keep legacy entries that weren't part of this audit
-                for e in all_entries:
-                    if e.get("owner") is None and e["id"] not in audited_ids and e["id"] not in {o["id"] for o in other_entries}:
-                        other_entries.append(e)
-                saved_entries = final_entries + other_entries
-            else:
-                saved_entries = final_entries
-            memory_manager.save(saved_entries)
-        logger.info(
-            f"Memory audit complete: {before_count} -> {after_count} entries "
-            f"({before_count - after_count} removed/merged)"
-        )
-
-        # Rebuild vector index from the full saved set, not just this owner's
-        # slice — otherwise the shared collection is wiped of every other
-        # owner's entries until they happen to run their own audit.
-        if memory_vector and memory_vector.healthy:
-            memory_vector.rebuild(saved_entries)
-
-        # Persist the post-tidy fingerprint so the next call short-circuits
-        # if nothing has changed in the meantime.
-        _save_tidy_state(memory_manager, owner, _fingerprint_entries(final_entries))
-
-        return {"before": before_count, "after": after_count}
-
-    except Exception as e:
-        logger.error(f"Memory audit failed: {e}")
-        return {"error": str(e)}
