@@ -708,6 +708,16 @@ async def curate(memory_manager, memory_vector, owner: Optional[str] = None, dry
     last_completed = checkpoint.get("last_completed_pass")
     start_idx = (PASS_ORDER.index(last_completed) + 1) if last_completed in PASS_ORDER else 0
 
+    def _persist(current_entries: List[Dict]) -> None:
+        """Merge this owner's working set back into the live store (preserving
+        other owners and any entries added concurrently during the run) and
+        save. Reloads fresh under the lock every time so concurrent writers
+        aren't clobbered."""
+        with memory_manager.lock:
+            fresh_all = memory_manager.load_all()
+            others = [e for e in fresh_all if e["id"] not in own_ids]
+            memory_manager.save(current_entries + others)
+
     entries = [copy.deepcopy(e) for e in existing]
     for idx in range(start_idx, len(PASS_ORDER)):
         pass_name = PASS_ORDER[idx]
@@ -724,6 +734,15 @@ async def curate(memory_manager, memory_vector, owner: Optional[str] = None, dry
         elif pass_name == "context_doc":
             await _run_context_doc_pass(owner, entries, cap, protected, dry_run)
         if not dry_run:
+            # Write-ahead ordering: a completed pass's mutations MUST be on
+            # disk before the checkpoint marks it done. curate() only ever
+            # persisted at the very end before this, so a crash in a later
+            # pass would advance the checkpoint (per-pass) yet lose every
+            # in-memory mutation — the resumed run then reloads the
+            # un-mutated store and SKIPS the "completed" pass, stranding
+            # entries (e.g. untriaged, generality=None, which the tags-only
+            # fingerprint short-circuit could then make permanent).
+            _persist(entries)
             _save_checkpoint(owner, pass_name)
 
     after_count = len(entries)
@@ -733,7 +752,6 @@ async def curate(memory_manager, memory_vector, owner: Optional[str] = None, dry
         with memory_manager.lock:
             fresh_all = memory_manager.load_all()
             others = [e for e in fresh_all if e["id"] not in own_ids]
-            memory_manager.save(entries + others)
         if memory_vector is not None and getattr(memory_vector, "healthy", False):
             try:
                 memory_vector.rebuild(entries + others)

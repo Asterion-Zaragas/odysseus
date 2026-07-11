@@ -315,6 +315,45 @@ async def test_curate_resumes_after_checkpoint_skips_completed_passes(_isolated_
         assert not any("triage" in c.lower() or "MERGE" in c for c in calls)
 
 
+async def test_curate_persists_each_pass_so_a_later_crash_keeps_earlier_work(_isolated_dirs, monkeypatch):
+    """A completed pass's mutations must be on disk before its checkpoint is
+    written — otherwise a crash in a later pass would advance the checkpoint
+    yet lose the in-memory work, and the resumed run (which skips completed
+    passes and reloads the un-mutated store) would strand the entry."""
+    with tempfile.TemporaryDirectory() as d:
+        mgr = MemoryManager(d)
+        e1 = mgr.add_entry("User likes tea", owner="alice")
+        e1["generality"] = None
+        e1["provisional_tags"] = ["drinks"]
+        mgr.save([e1])
+
+        async def fake_llm(role, messages, owner=None, **kwargs):
+            if "promote_tags" in messages[0]["content"]:
+                return f'[{{"id": "{e1["id"]}", "generality": 2, "promote_tags": ["drinks"]}}]'
+            return "[]"
+
+        monkeypatch.setattr("src.task_endpoint.memory_llm_call_async", fake_llm)
+
+        # Simulate a crash in the (later) rescore pass.
+        def _boom(*a, **k):
+            raise RuntimeError("simulated crash mid-run")
+
+        monkeypatch.setattr(cur, "_run_rescore_pass", _boom)
+
+        with pytest.raises(RuntimeError):
+            await cur.curate(mgr, None, owner="alice", dry_run=False)
+
+        # Triage ran and was persisted before the crash: generality is set and
+        # the provisional tag was promoted, despite curate() never reaching its
+        # final save. The checkpoint sits at the last pass that completed, so a
+        # resume skips triage/dedupe without losing their work.
+        stored = mgr.load(owner="alice")
+        assert stored[0]["generality"] == 2
+        assert "drinks" in stored[0]["tags"]
+        assert stored[0]["provisional_tags"] == []
+        assert cur._load_checkpoint("alice")["last_completed_pass"] == "tag_normalize"
+
+
 # ── triage_new_entries (cheap extractor-trigger path) ──
 
 async def test_triage_new_entries_only_touches_pending(_isolated_dirs, monkeypatch):
