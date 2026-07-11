@@ -342,14 +342,20 @@ async def do_manage_memory(content: str, session_id: Optional[str] = None, owner
       Line 2+: action-specific params
 
     Actions:
-      list                    — list all memories (optional line 2: category filter)
-      add                     — line 2: text, optional line 3: category (fact|event|contact|preference)
+      list                    — list all memories (optional line 2: tag filter)
+      add                     — line 2: text, optional line 3: tag (e.g. fact, contact, preference)
       edit                    — line 2: memory_id, line 3: new text
       delete                  — line 2: memory_id
       search                  — line 2: query
     """
+    from src.memory import normalize_tag
+
     if not _memory_manager:
         return {"error": "Memory manager not available"}
+
+    def _tag_label(m) -> str:
+        tags = m.get("tags") or []
+        return ",".join(tags) if tags else "fact"
 
     lines = content.strip().split("\n")
     if not lines:
@@ -358,21 +364,20 @@ async def do_manage_memory(content: str, session_id: Optional[str] = None, owner
     action = lines[0].strip().lower()
 
     if action == "list":
-        category_filter = lines[1].strip().lower() if len(lines) > 1 and lines[1].strip() else None
+        tag_filter = normalize_tag(lines[1]) if len(lines) > 1 and lines[1].strip() else None
         memories = _memory_manager.load(owner=owner)
-        if category_filter:
-            memories = [m for m in memories if m.get("category", "").lower() == category_filter]
+        if tag_filter:
+            memories = [m for m in memories if tag_filter in (m.get("tags") or [])]
         if not memories:
-            return {"results": "No memories found" + (f" in category '{category_filter}'" if category_filter else "") + "."}
+            return {"results": "No memories found" + (f" with tag '{tag_filter}'" if tag_filter else "") + "."}
 
         result_lines = [f"Found {len(memories)} memory entries:\n"]
         for m in memories:
-            cat = m.get("category", "fact")
             mid = m.get("id", "?")[:8]
             text = m.get("text", "")
             if len(text) > 150:
                 text = text[:150] + "..."
-            result_lines.append(f"- [{cat}] `{mid}` — {text}")
+            result_lines.append(f"- [{_tag_label(m)}] `{mid}` — {text}")
         return {"results": "\n".join(result_lines)}
 
     elif action == "add":
@@ -384,9 +389,10 @@ async def do_manage_memory(content: str, session_id: Optional[str] = None, owner
             return {"error": "Memory text cannot be empty"}
 
         entry = _memory_manager.add_entry(text, source="ai_agent", category=category, owner=owner)
-        memories = _memory_manager.load_all()
-        memories.append(entry)
-        _memory_manager.save(memories)
+        with _memory_manager.lock:
+            memories = _memory_manager.load_all()
+            memories.append(entry)
+            _memory_manager.save(memories)
 
         # Update vector index if available
         if _memory_vector and hasattr(_memory_vector, 'healthy') and _memory_vector.healthy:
@@ -401,7 +407,7 @@ async def do_manage_memory(content: str, session_id: Optional[str] = None, owner
             logger.debug("memory_added event dispatch failed", exc_info=True)
 
         return {"action": "add", "memory_id": entry["id"],
-                "results": f"Memory added: [{category}] {text}"}
+                "results": f"Memory added: [{_tag_label(entry)}] {text}"}
 
     elif action == "edit":
         if len(lines) < 3:
@@ -411,21 +417,22 @@ async def do_manage_memory(content: str, session_id: Optional[str] = None, owner
         if not new_text:
             return {"error": "New text cannot be empty"}
 
-        memories = _memory_manager.load_all()
-        found = False
-        for m in memories:
-            if m.get("id", "").startswith(memory_id):
-                # Verify ownership
-                if owner and m.get("owner") != owner:
-                    return {"error": f"Memory '{memory_id}' not found"}
-                m["text"] = new_text
-                m["timestamp"] = int(time.time())
-                found = True
-                full_id = m["id"]
-                break
-        if not found:
-            return {"error": f"Memory '{memory_id}' not found"}
-        _memory_manager.save(memories)
+        with _memory_manager.lock:
+            memories = _memory_manager.load_all()
+            found = False
+            for m in memories:
+                if m.get("id", "").startswith(memory_id):
+                    # Verify ownership
+                    if owner and m.get("owner") != owner:
+                        return {"error": f"Memory '{memory_id}' not found"}
+                    m["text"] = new_text
+                    m["timestamp"] = int(time.time())
+                    found = True
+                    full_id = m["id"]
+                    break
+            if not found:
+                return {"error": f"Memory '{memory_id}' not found"}
+            _memory_manager.save(memories)
 
         # Update vector index
         if _memory_vector and hasattr(_memory_vector, 'healthy') and _memory_vector.healthy:
@@ -442,22 +449,23 @@ async def do_manage_memory(content: str, session_id: Optional[str] = None, owner
             return {"error": "Delete needs line 2: memory_id"}
         memory_id = lines[1].strip()
 
-        memories = _memory_manager.load_all()
-        original_len = len(memories)
-        full_id = None
-        delete_id = None
-        for m in memories:
-            if m.get("id", "").startswith(memory_id):
-                # Verify ownership
-                if owner and m.get("owner") != owner:
-                    return {"error": f"Memory '{memory_id}' not found"}
-                full_id = m["id"]
-                delete_id = m["id"]
-                break
-        memories = [m for m in memories if m.get("id") != delete_id]
-        if len(memories) == original_len:
-            return {"error": f"Memory '{memory_id}' not found"}
-        _memory_manager.save(memories)
+        with _memory_manager.lock:
+            memories = _memory_manager.load_all()
+            original_len = len(memories)
+            full_id = None
+            delete_id = None
+            for m in memories:
+                if m.get("id", "").startswith(memory_id):
+                    # Verify ownership
+                    if owner and m.get("owner") != owner:
+                        return {"error": f"Memory '{memory_id}' not found"}
+                    full_id = m["id"]
+                    delete_id = m["id"]
+                    break
+            memories = [m for m in memories if m.get("id") != delete_id]
+            if len(memories) == original_len:
+                return {"error": f"Memory '{memory_id}' not found"}
+            _memory_manager.save(memories)
 
         # Remove from vector index
         if _memory_vector and full_id and hasattr(_memory_vector, 'healthy') and _memory_vector.healthy:
@@ -496,10 +504,9 @@ async def do_manage_memory(content: str, session_id: Optional[str] = None, owner
             return {"results": f"No memories found matching '{query}'."}
         result_lines = [f"Found {len(results)} matching memories:\n"]
         for m in results:
-            cat = m.get("category", "fact")
             mid = m.get("id", "?")[:8]
             text = m.get("text", "")
-            result_lines.append(f"- [{cat}] `{mid}` — {text}")
+            result_lines.append(f"- [{_tag_label(m)}] `{mid}` — {text}")
         return {"results": "\n".join(result_lines)}
 
     else:

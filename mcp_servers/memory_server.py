@@ -112,8 +112,7 @@ async def list_tools() -> list[Tool]:
                     "memory_id": {"type": "string", "description": "Memory ID (edit/delete)"},
                     "category": {
                         "type": "string",
-                        "enum": ["fact", "event", "contact", "preference"],
-                        "description": "Memory category (add/list filter)",
+                        "description": "Memory tag, e.g. fact, contact, preference (add/list filter)",
                     },
                 },
                 "required": ["action"],
@@ -131,29 +130,34 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     if not _memory_manager:
         return _text_result("Error: Memory manager not available")
 
+    from src.memory import normalize_tag
+
+    def _tag_label(m) -> str:
+        tags = m.get("tags") or []
+        return ",".join(tags) if tags else "fact"
+
     action = arguments.get("action", "")
 
     if action == "list":
-        category_filter = arguments.get("category", "")
+        tag_filter = normalize_tag(arguments.get("category", ""))
         _owner, _all_memories, memories, scope_error = _scope_entries()
         if scope_error:
             return _text_result(scope_error)
-        if category_filter:
-            memories = [m for m in memories if m.get("category", "").lower() == category_filter.lower()]
+        if tag_filter:
+            memories = [m for m in memories if tag_filter in (m.get("tags") or [])]
         if not memories:
             msg = "No memories found"
-            if category_filter:
-                msg += f" in category '{category_filter}'"
+            if tag_filter:
+                msg += f" with tag '{tag_filter}'"
             return _text_result(msg + ".")
 
         lines = [f"Found {len(memories)} memory entries:\n"]
         for m in memories:
-            cat = m.get("category", "fact")
             mid = m.get("id", "?")[:8]
             text = m.get("text", "")
             if len(text) > 150:
                 text = text[:150] + "..."
-            lines.append(f"- [{cat}] `{mid}` — {text}")
+            lines.append(f"- [{_tag_label(m)}] `{mid}` — {text}")
         return _text_result("\n".join(lines))
 
     elif action == "add":
@@ -165,14 +169,15 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         if scope_error:
             return _text_result(scope_error)
         entry = _memory_manager.add_entry(text, source="ai_agent", category=category, owner=owner)
-        memories.append(entry)
-        _memory_manager.save(memories)
+        with _memory_manager.lock:
+            memories.append(entry)
+            _memory_manager.save(memories)
         if _memory_vector and _memory_vector.healthy:
             try:
                 _memory_vector.add(entry["id"], text)
             except Exception:
                 pass
-        return _text_result(f"Memory added: [{category}] {text} (id: {entry['id'][:8]})")
+        return _text_result(f"Memory added: [{_tag_label(entry)}] {text} (id: {entry['id'][:8]})")
 
     elif action == "edit":
         memory_id = arguments.get("memory_id", "")
@@ -212,12 +217,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return _text_result(scope_error)
         full_id = None
         deleted_text = ""
-        deleted_category = ""
+        deleted_label = ""
         for m in visible:
             if m.get("id", "").startswith(memory_id):
                 full_id = m["id"]
                 deleted_text = m.get("text", "")
-                deleted_category = m.get("category", "")
+                deleted_label = _tag_label(m)
                 break
         if not full_id:
             return _text_result(f"Error: Memory '{memory_id}' not found")
@@ -228,7 +233,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 _memory_vector.remove(full_id)
             except Exception:
                 pass
-        cat = f"[{deleted_category}] " if deleted_category else ""
+        cat = f"[{deleted_label}] " if deleted_label else ""
         snippet = deleted_text if len(deleted_text) <= 120 else deleted_text[:117] + "..."
         return _text_result(f"Memory deleted: {cat}{snippet} (id: {memory_id})")
 
@@ -248,10 +253,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return _text_result(f"No memories found matching '{query}'.")
         lines = [f"Found {len(results)} matching memories:\n"]
         for m in results:
-            cat = m.get("category", "fact")
             mid = m.get("id", "?")[:8]
             text = m.get("text", "")
-            lines.append(f"- [{cat}] `{mid}` — {text}")
+            lines.append(f"- [{_tag_label(m)}] `{mid}` — {text}")
         return _text_result("\n".join(lines))
 
     else:

@@ -222,22 +222,22 @@ class ChatProcessor:
             # Normalize BM25 to roughly 0-1 range (cap at a reasonable max)
             kw_norm = min(kw / 6.0, 1.0) if kw > 0 else 0.0
 
-            # Category-aware boost for identity/contact queries
-            category = mem.get("category", "fact")
+            # Tag-aware boost for identity/contact queries
+            tags = mem.get("tags") or []
             msg_lower = message.lower()
             mem_lower = mem["text"].lower()
-            cat_boost = 1.0
+            tag_boost = 1.0
             if any(w in msg_lower for w in ["name", "who am i", "my name"]):
-                if category == "identity" or any(w in mem_lower for w in ["name is", "i am", "called"]):
-                    cat_boost = 1.4
+                if "identity" in tags or any(w in mem_lower for w in ["name is", "i am", "called"]):
+                    tag_boost = 1.4
             elif any(w in msg_lower for w in ["phone", "email", "address", "contact"]):
-                if category == "contact" or "@" in mem_lower:
-                    cat_boost = 1.3
+                if "contact" in tags or "@" in mem_lower:
+                    tag_boost = 1.3
             elif any(w in msg_lower for w in ["like", "prefer", "favorite"]):
-                if category == "preference":
-                    cat_boost = 1.2
+                if "preference" in tags:
+                    tag_boost = 1.2
 
-            kw_norm = min(kw_norm * cat_boost, 1.0)
+            kw_norm = min(kw_norm * tag_boost, 1.0)
 
             # Recency — tiebreaker only (max 5% contribution)
             ts = mem.get("timestamp", 0)
@@ -344,7 +344,7 @@ class ChatProcessor:
                         ),
                     ))
                     for m in relevant:
-                        self._last_used_memories.append({"text": m["text"], "category": m.get("category", "fact"), "type": "recalled"})
+                        self._last_used_memories.append({"text": m["text"], "tags": m.get("tags") or [], "type": "recalled"})
                         if m.get("id"):
                             _used_ids.append(m["id"])
 

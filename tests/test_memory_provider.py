@@ -45,7 +45,7 @@ def test_native_provider_remember_writes_native_memory_and_vector(tmp_path):
     assert len(stored) == 1
     assert stored[0]["id"] == record.id
     assert stored[0]["text"] == "User prefers concise responses"
-    assert stored[0]["category"] == "preference"
+    assert stored[0]["tags"] == ["preference"]
     assert stored[0]["session_id"] == "session-1"
     assert record.metadata["confidence"] == 0.9
     assert vector.added == [(record.id, "User prefers concise responses")]

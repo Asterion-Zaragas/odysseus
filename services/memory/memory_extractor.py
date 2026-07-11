@@ -30,10 +30,12 @@ def _tidy_state_path(memory_manager) -> str:
 
 
 def _fingerprint_entries(entries) -> str:
-    """Stable hash of an owner's memories — order-independent, depends
-    only on id+text+category. Any add/edit/delete invalidates it."""
+    """Stable hash of an owner's memories — order-independent, depends only
+    on id+text+tags. Any add/edit/delete/retag invalidates it. Deliberately
+    excludes uses/last_used_at: retrieval bumps those constantly and must not
+    defeat the audit short-circuit."""
     items = sorted(
-        (str(e.get("id", "")), e.get("text", ""), e.get("category", ""))
+        (str(e.get("id", "")), e.get("text", ""), ",".join(sorted(e.get("tags") or [])))
         for e in _memory_dicts(entries)
     )
     h = hashlib.sha256()
@@ -104,8 +106,9 @@ AUDIT_SYSTEM_PROMPT = (
     "3. Keep the original wording. Only lightly trim obvious redundancy — do "
     "NOT aggressively rewrite or shorten.\n"
     "4. Preserve the 'id' of the entry you keep when merging.\n"
-    "5. Never invent facts. When unsure, KEEP.\n\n"
-    "Return a JSON array of objects with fields: id, text, category.\n"
+    "5. Never invent facts. When unsure, KEEP.\n"
+    "6. Keep each entry's 'tags' list unless merging (then union the tags).\n\n"
+    "Return a JSON array of objects with fields: id, text, tags.\n"
     "Return ONLY valid JSON, no markdown fences."
 )
 
@@ -389,8 +392,11 @@ async def extract_and_store(
 
         existing = memory_manager.load_all()
         added = 0
+        new_entries = []
 
         for fact in facts:
+            # The extraction prompt still speaks "category" (rework lands with
+            # the distiller upgrade); its value becomes the entry's first tag.
             if isinstance(fact, str):
                 fact_text = fact
                 category = "fact"
@@ -438,15 +444,20 @@ async def extract_and_store(
                 continue
 
             entry = memory_manager.add_entry(fact_text, source="auto", category=category, owner=_owner)
-            # Auto-pin identity facts (name, job, location) — core context
-            if category == "identity":
+            # Auto-pin identity facts (name, job, location) — core context.
+            # Goes away with the distiller upgrade: generality → tier 0 takes over.
+            if "identity" in entry["tags"]:
                 entry["pinned"] = True
             if hasattr(session, "session_id"):
                 entry["session_id"] = session.session_id
             elif hasattr(session, "name"):
                 entry["session_id"] = session.name
 
+            # `existing` doubles as the intra-batch dedup corpus; `new_entries`
+            # is what actually gets persisted (re-loaded under the lock below,
+            # so entries added elsewhere during this batch aren't clobbered).
             existing.append(entry)
+            new_entries.append(entry)
 
             # Add to vector index. The JSON store (saved below) is the source of
             # truth and the keyword path can still retrieve this entry, so a vector
@@ -460,7 +471,10 @@ async def extract_and_store(
             added += 1
 
         if added > 0:
-            memory_manager.save(existing)
+            with memory_manager.lock:
+                fresh = memory_manager.load_all()
+                fresh.extend(new_entries)
+                memory_manager.save(fresh)
             try:
                 from src.event_bus import fire_event
                 for _ in range(added):
@@ -528,9 +542,9 @@ async def audit_memories(
                 "already_tidy": True,
             }
 
-        # Build payload: list of {id, text, category} for the LLM
+        # Build payload: list of {id, text, tags} for the LLM
         memory_payload = [
-            {"id": m["id"], "text": m["text"], "category": m.get("category", "fact")}
+            {"id": m["id"], "text": m["text"], "tags": m.get("tags") or []}
             for m in existing
         ]
 
@@ -598,11 +612,16 @@ async def audit_memories(
                 continue
 
             if mid in originals:
-                # Preserve original metadata, update text + category
+                # Preserve original metadata, update text + tags
+                from src.memory import normalize_tags
                 entry = originals[mid].copy()
                 entry["text"] = new_text
-                if item.get("category"):
-                    entry["category"] = item["category"]
+                returned_tags = item.get("tags")
+                if returned_tags is None and item.get("category"):
+                    # Model answered in the pre-tags shape
+                    returned_tags = [item["category"]]
+                if returned_tags:
+                    entry["tags"] = normalize_tags(returned_tags)
             else:
                 # ID not found — skip to avoid inventing entries
                 logger.debug(f"Audit returned unknown id {mid}, skipping")
@@ -624,19 +643,22 @@ async def audit_memories(
             )
             return {"before": before_count, "after": before_count, "error": "unsafe_removal"}
 
-        # Merge audited entries back with other users' entries
-        if owner:
-            all_entries = memory_manager.load_all()
-            audited_ids = {e["id"] for e in final_entries}
-            other_entries = [e for e in all_entries if e.get("owner") != owner and (e.get("owner") is not None)]
-            # Also keep legacy entries that weren't part of this audit
-            for e in all_entries:
-                if e.get("owner") is None and e["id"] not in audited_ids and e["id"] not in {o["id"] for o in other_entries}:
-                    other_entries.append(e)
-            saved_entries = final_entries + other_entries
-        else:
-            saved_entries = final_entries
-        memory_manager.save(saved_entries)
+        # Merge audited entries back with other users' entries. Under the
+        # store lock: the reload + save must be one unit or a memory written
+        # during the (long) audit LLM call gets silently dropped.
+        with memory_manager.lock:
+            if owner:
+                all_entries = memory_manager.load_all()
+                audited_ids = {e["id"] for e in final_entries}
+                other_entries = [e for e in all_entries if e.get("owner") != owner and (e.get("owner") is not None)]
+                # Also keep legacy entries that weren't part of this audit
+                for e in all_entries:
+                    if e.get("owner") is None and e["id"] not in audited_ids and e["id"] not in {o["id"] for o in other_entries}:
+                        other_entries.append(e)
+                saved_entries = final_entries + other_entries
+            else:
+                saved_entries = final_entries
+            memory_manager.save(saved_entries)
         logger.info(
             f"Memory audit complete: {before_count} -> {after_count} entries "
             f"({before_count - after_count} removed/merged)"

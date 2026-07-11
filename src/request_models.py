@@ -35,16 +35,11 @@ class SessionCreateRequest(BaseModel):
 
 class MemoryAddRequest(BaseModel):
     text: str = Field(..., min_length=1, max_length=5000, description="Memory text")
-    category: str = Field(default="fact", description="Memory category")
+    tags: Optional[List[str]] = Field(default=None, description="Facet tags (max 10)")
+    # Deprecated alias for old clients/exports; folded into tags on store.
+    category: Optional[str] = Field(default=None, description="Legacy memory category")
     source: str = Field(default="user", description="Memory source")
     session_id: Optional[str] = Field(default=None, description="Associated session ID")
-
-    @field_validator('category')
-    @classmethod
-    def validate_category(cls, v):
-        if v not in ['fact', 'contact', 'task', 'preference', 'identity', 'project', 'goal']:
-            return 'fact'  # Default to 'fact' if invalid
-        return v
 
 
 class MemoryUpdateRequest(BaseModel):

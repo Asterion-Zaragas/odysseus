@@ -6,21 +6,23 @@ deleted. The fix honors the explicit `drop` set, so an omitted memory survives.
 """
 import asyncio
 import json
+import threading
 
 import src.builtin_actions as ba
 
 
 class _FakeMM:
     saved = None
+    lock = threading.RLock()
 
     def __init__(self, *args, **kwargs):
         pass
 
     def load_all(self):
         return [
-            {"id": "a", "owner": "alice", "text": "Likes dark roast coffee", "category": "preference"},
-            {"id": "b", "owner": "alice", "text": "Likes dark roast coffee too", "category": "preference"},
-            {"id": "c", "owner": "alice", "text": "Lives in Cairo", "category": "fact"},
+            {"id": "a", "owner": "alice", "text": "Likes dark roast coffee", "tags": ["preference"]},
+            {"id": "b", "owner": "alice", "text": "Likes dark roast coffee too", "tags": ["preference"]},
+            {"id": "c", "owner": "alice", "text": "Lives in Cairo", "tags": ["fact"]},
         ]
 
     def save(self, entries):

@@ -185,7 +185,7 @@ async def action_consolidate_memory(owner: str, **kwargs) -> Tuple[str, bool]:
                 items = [
                     {
                         "id": m.get("id"),
-                        "category": m.get("category", "fact"),
+                        "tags": m.get("tags") or [],
                         "text": (m.get("text") or "").strip()[:text_limit],
                         "truncated": len((m.get("text") or "").strip()) > text_limit,
                     }
@@ -202,7 +202,7 @@ async def action_consolidate_memory(owner: str, **kwargs) -> Tuple[str, bool]:
                     "contacts, project context, and instructions. If memories conflict, keep the clearest/latest "
                     "one and drop the obsolete one.\n\n"
                     "JSON shape:\n"
-                    "{\"keep\":[{\"id\":\"existing id\",\"text\":\"cleaned text\",\"category\":\"fact|preference|identity|event|contact|project|instruction\"}],"
+                    "{\"keep\":[{\"id\":\"existing id\",\"text\":\"cleaned text\",\"tags\":[\"keep the entry's tags\"]}],"
                     "\"drop\":[{\"id\":\"existing id\",\"reason\":\"short reason\"}]}\n\n"
                     f"MEMORIES:\n{json.dumps(items, ensure_ascii=False)}"
                 )
@@ -236,8 +236,13 @@ async def action_consolidate_memory(owner: str, **kwargs) -> Tuple[str, bool]:
                             text = (item.get("text") or "").strip()
                             if not text:
                                 continue
+                            from src.memory import normalize_tags
+                            returned_tags = item.get("tags")
+                            if returned_tags is None and item.get("category"):
+                                # Model answered in the pre-tags shape
+                                returned_tags = [item["category"]]
                             cleaned = {
-                                "category": (item.get("category") or by_id[mid].get("category") or "fact").strip(),
+                                "tags": normalize_tags(returned_tags or by_id[mid].get("tags") or []),
                             }
                             original_text = (by_id[mid].get("text") or "").strip()
                             if len(original_text) <= text_limit:
@@ -274,8 +279,8 @@ async def action_consolidate_memory(owner: str, **kwargs) -> Tuple[str, bool]:
                                 if cleaned.get("text") and cleaned["text"] != mem.get("text"):
                                     mem["text"] = cleaned["text"]
                                     changed_text += 1
-                                if cleaned.get("category"):
-                                    mem["category"] = cleaned["category"]
+                                if cleaned.get("tags"):
+                                    mem["tags"] = cleaned["tags"]
                                 kept_all.append(mem)
 
                             removed = sum(1 for m in group_memories if m.get("id") in drop_ids)
@@ -338,7 +343,8 @@ async def action_consolidate_memory(owner: str, **kwargs) -> Tuple[str, bool]:
             total_removed += group_removed
 
         if total_removed or total_cleaned:
-            manager.save(all_memories)
+            with manager.lock:
+                manager.save(all_memories)
             if ai_used:
                 reasons = ai_reasons[:3]
                 reason_text = f": {'; '.join(reasons)}" if reasons else ""

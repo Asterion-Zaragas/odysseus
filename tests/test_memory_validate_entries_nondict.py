@@ -15,5 +15,5 @@ def test_validate_entries_skips_non_dict_rows(tmp_path):
     ])
     assert [e["id"] for e in out] == ["a"]
     # the surviving entry is still backfilled with required defaults
-    assert out[0]["category"] == "fact"
+    assert out[0]["tags"] == []
     assert out[0]["source"] == "unknown"

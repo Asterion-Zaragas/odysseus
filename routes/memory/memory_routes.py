@@ -23,6 +23,7 @@ def _strip_list_prefix(text: str) -> str:
 
 from services.memory import MemoryManager
 from core.session_manager import SessionManager
+from src.memory import compat_category, normalize_tags
 from src.request_models import MemoryAddRequest
 from core.database import SessionLocal
 from src.llm_core import llm_call_async
@@ -66,6 +67,14 @@ def setup_memory_routes(memory_manager: MemoryManager, session_manager: SessionM
         if memory.get("owner") != user:
             raise HTTPException(404, "Memory not found")
 
+    def _with_compat(memory: dict) -> dict:
+        """Response copy carrying a computed legacy `category` field.
+
+        The memory UI still filters/badges on `category` (until the Phase 7
+        tags UI); storage is tags-only, so responses synthesize it.
+        """
+        return {**memory, "category": compat_category(memory)}
+
     @router.post("/debug")
     def debug_memory_relevance(request: Request, query: str = Form(...)):
         """Debug which memories would be triggered for a query"""
@@ -77,7 +86,8 @@ def setup_memory_routes(memory_manager: MemoryManager, session_manager: SessionM
             "query": query,
             "total_memories": len(memories),
             "relevant_count": len(relevant),
-            "relevant_memories": [{"text": m["text"], "category": m.get("category", "unknown")}
+            "relevant_memories": [{"text": m["text"], "tags": m.get("tags") or [],
+                                   "category": compat_category(m)}
                                  for m in relevant]
         }
 
@@ -86,14 +96,23 @@ def setup_memory_routes(memory_manager: MemoryManager, session_manager: SessionM
         request: Request,
         memory_data: Optional[MemoryAddRequest] = None
     ):
-        """Add a new memory entry with optional category, source, and session reference."""
+        """Add a new memory entry with optional tags, source, and session reference."""
         from src.auth_helpers import require_privilege
         require_privilege(request, "can_manage_memory")
         if memory_data is None:
             form = await request.form()
+            raw_tags = form.get("tags")
+            tags = None
+            if raw_tags:
+                try:
+                    parsed = json.loads(raw_tags)
+                    tags = parsed if isinstance(parsed, list) else None
+                except json.JSONDecodeError:
+                    tags = [t for t in raw_tags.split(",") if t.strip()]
             memory_data = MemoryAddRequest(
                 text=form.get("text"),
-                category=form.get("category", "fact"),
+                tags=tags,
+                category=form.get("category"),
                 source=form.get("source", "user"),
                 session_id=form.get("session_id")
             )
@@ -113,12 +132,16 @@ def setup_memory_routes(memory_manager: MemoryManager, session_manager: SessionM
                 raise HTTPException(404, "Session not found")
             _assert_session_owner(session_obj, user)
 
-        new_entry = memory_manager.add_entry(text, memory_data.source, memory_data.category, owner=user)
+        new_entry = memory_manager.add_entry(
+            text, memory_data.source, tags=memory_data.tags,
+            category=memory_data.category, owner=user,
+        )
         if memory_data.session_id:
             new_entry["session_id"] = memory_data.session_id
-        all_mem = memory_manager.load_all()
-        all_mem.append(new_entry)
-        memory_manager.save(all_mem)
+        with memory_manager.lock:
+            all_mem = memory_manager.load_all()
+            all_mem.append(new_entry)
+            memory_manager.save(all_mem)
         # Sync vector index
         if memory_vector and memory_vector.healthy:
             memory_vector.add(new_entry["id"], text)
@@ -133,23 +156,33 @@ def setup_memory_routes(memory_manager: MemoryManager, session_manager: SessionM
     def api_get_memory(request: Request):
         """Return all memory entries with their metadata."""
         user = _owner(request)
-        return {"memory": memory_manager.load(owner=user)}
+        return {"memory": [_with_compat(m) for m in memory_manager.load(owner=user)]}
 
     @router.post("/search")
-    def search_memories(request: Request, query: str = Form(...), session_id: str = Form(None), category: str = Form(None)):
-        """Search across all memories with optional filters."""
+    def search_memories(request: Request, query: str = Form(...), session_id: str = Form(None),
+                        tag: str = Form(None), category: str = Form(None)):
+        """Search across all memories with optional filters.
+
+        `tag` filters on the tags list; `category` is a legacy alias for it.
+        """
         user = _owner(request)
         memories = memory_manager.load(owner=user)
 
         if session_id:
             memories = [m for m in memories if m.get("session_id") == session_id]
 
-        if category:
-            memories = [m for m in memories if category in m.get("categories", [m.get("category", "")])]
+        tag_filter = tag or category
+        # Direct (non-FastAPI) callers leave the Form(None) sentinel in place
+        # of an omitted param — only a real string is a filter.
+        if not isinstance(tag_filter, str):
+            tag_filter = None
+        if tag_filter:
+            wanted = normalize_tags([tag_filter])
+            memories = [m for m in memories if wanted and wanted[0] in (m.get("tags") or [])]
 
         relevant = memory_manager.get_relevant_memories(query, memories, threshold=0.05, max_items=20)
 
-        return {"memories": relevant, "total": len(relevant), "query": query}
+        return {"memories": [_with_compat(m) for m in relevant], "total": len(relevant), "query": query}
 
     @router.get("/timeline")
     def memory_timeline(request: Request):
@@ -160,6 +193,7 @@ def setup_memory_routes(memory_manager: MemoryManager, session_manager: SessionM
 
         results = []
         for memory in sorted_memories:
+            memory = _with_compat(memory)
             if "timestamp" in memory:
                 try:
                     dt = datetime.fromtimestamp(memory["timestamp"])
@@ -199,7 +233,7 @@ def setup_memory_routes(memory_manager: MemoryManager, session_manager: SessionM
             raise HTTPException(404, f"Session {session_id} not found")
         _assert_session_owner(_session_obj, user)
         memories = memory_manager.load(owner=user)
-        session_memories = [m for m in memories if m.get("session_id") == session_id]
+        session_memories = [_with_compat(m) for m in memories if m.get("session_id") == session_id]
 
         session_memories.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
 
@@ -405,9 +439,13 @@ def setup_memory_routes(memory_manager: MemoryManager, session_manager: SessionM
                 direct = []
                 for item in parsed:
                     if isinstance(item, dict) and item.get("text"):
+                        # Post-upgrade exports carry `tags`; pre-upgrade ones
+                        # carry `category`. Preserve both for the save step.
+                        item_tags = normalize_tags(item.get("tags") or [])
                         direct.append({
                             "text": _strip_list_prefix(str(item["text"])),
-                            "category": item.get("category") or "fact",
+                            "tags": item_tags,
+                            "category": item.get("category") or (item_tags[0] if item_tags else "fact"),
                         })
                     elif isinstance(item, str) and item.strip():
                         direct.append({
@@ -487,13 +525,14 @@ def setup_memory_routes(memory_manager: MemoryManager, session_manager: SessionM
     def pin_memory(request: Request, memory_id: str, pinned: bool = Form(True)):
         """Pin or unpin a memory. Pinned memories are always included in context."""
         user = _owner(request)
-        all_mem = memory_manager.load_all()
-        for i, memory in enumerate(all_mem):
-            if memory["id"] == memory_id:
-                _verify_memory_owner(memory, user)
-                all_mem[i]["pinned"] = pinned
-                memory_manager.save(all_mem)
-                return {"ok": True, "pinned": pinned}
+        with memory_manager.lock:
+            all_mem = memory_manager.load_all()
+            for i, memory in enumerate(all_mem):
+                if memory["id"] == memory_id:
+                    _verify_memory_owner(memory, user)
+                    all_mem[i]["pinned"] = pinned
+                    memory_manager.save(all_mem)
+                    return {"ok": True, "pinned": pinned}
         raise HTTPException(404, f"Memory item {memory_id} not found")
 
     # Wildcard routes MUST come last — otherwise they swallow /import, /search, etc.
@@ -504,29 +543,44 @@ def setup_memory_routes(memory_manager: MemoryManager, session_manager: SessionM
         memories = memory_manager.load(owner=user)
         for memory in memories:
             if memory["id"] == memory_id:
-                return {"memory": memory}
+                return {"memory": _with_compat(memory)}
 
         raise HTTPException(404, "Memory not found")
 
     @router.put("/{memory_id}")
-    def update_memory(request: Request, memory_id: str, text: str = Form(...), category: str = Form(None)):
-        """Update an existing memory item with new text and optional category."""
-        user = _owner(request)
-        all_mem = memory_manager.load_all()
-        for i, memory in enumerate(all_mem):
-            if memory["id"] == memory_id:
-                _verify_memory_owner(memory, user)
-                all_mem[i]["text"] = text.strip()
-                if category:
-                    all_mem[i]["category"] = category
-                all_mem[i]["timestamp"] = int(time.time())
+    def update_memory(request: Request, memory_id: str, text: str = Form(...),
+                      tags: str = Form(None), category: str = Form(None)):
+        """Update an existing memory item with new text and optional tags.
 
-                memory_manager.save(all_mem)
-                # Sync vector index (remove old, add updated)
-                if memory_vector and memory_vector.healthy:
-                    memory_vector.remove(memory_id)
-                    memory_vector.add(memory_id, text.strip())
-                return {"ok": True, "message": "Memory updated successfully"}
+        `tags` (JSON array or comma-separated) replaces the tag list.
+        `category` is the legacy alias: it swaps the first tag (which is the
+        migrated category) and keeps the rest.
+        """
+        user = _owner(request)
+        with memory_manager.lock:
+            all_mem = memory_manager.load_all()
+            for i, memory in enumerate(all_mem):
+                if memory["id"] == memory_id:
+                    _verify_memory_owner(memory, user)
+                    all_mem[i]["text"] = text.strip()
+                    if tags is not None:
+                        try:
+                            parsed = json.loads(tags)
+                            tag_list = parsed if isinstance(parsed, list) else [tags]
+                        except json.JSONDecodeError:
+                            tag_list = tags.split(",")
+                        all_mem[i]["tags"] = normalize_tags(tag_list)
+                    elif category:
+                        rest = (memory.get("tags") or [])[1:]
+                        all_mem[i]["tags"] = normalize_tags([category] + rest)
+                    all_mem[i]["timestamp"] = int(time.time())
+
+                    memory_manager.save(all_mem)
+                    # Sync vector index (remove old, add updated)
+                    if memory_vector and memory_vector.healthy:
+                        memory_vector.remove(memory_id)
+                        memory_vector.add(memory_id, text.strip())
+                    return {"ok": True, "message": "Memory updated successfully"}
 
         raise HTTPException(404, f"Memory item {memory_id} not found")
 
@@ -534,16 +588,17 @@ def setup_memory_routes(memory_manager: MemoryManager, session_manager: SessionM
     def delete_memory(request: Request, memory_id: str):
         """Delete a memory item by its ID."""
         user = _owner(request)
-        all_mem = memory_manager.load_all()
+        with memory_manager.lock:
+            all_mem = memory_manager.load_all()
 
-        # Find and verify ownership before deleting
-        target = next((m for m in all_mem if m["id"] == memory_id), None)
-        if not target:
-            raise HTTPException(404, f"Memory item {memory_id} not found")
-        _verify_memory_owner(target, user)
+            # Find and verify ownership before deleting
+            target = next((m for m in all_mem if m["id"] == memory_id), None)
+            if not target:
+                raise HTTPException(404, f"Memory item {memory_id} not found")
+            _verify_memory_owner(target, user)
 
-        all_mem = [m for m in all_mem if m["id"] != memory_id]
-        memory_manager.save(all_mem)
+            all_mem = [m for m in all_mem if m["id"] != memory_id]
+            memory_manager.save(all_mem)
         # Sync vector index
         if memory_vector and memory_vector.healthy:
             memory_vector.remove(memory_id)

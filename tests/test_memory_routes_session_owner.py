@@ -228,7 +228,7 @@ def test_import_missing_session_uses_utility_fallback(monkeypatch):
     out = asyncio.run(import_memories(request=_request("alice"), session="missing-session", file=_upload()))
 
     assert out == {
-        "suggestions": [{"text": "Project Phoenix uses Python", "category": "project"}],
+        "suggestions": [{"text": "Project Phoenix uses Python", "tags": [], "category": "project"}],
         "filename": "memories.json",
     }
     session_manager.get_session.assert_called_once_with("missing-session")
@@ -254,7 +254,7 @@ def test_import_foreign_session_uses_same_utility_fallback(monkeypatch):
 
     out = asyncio.run(import_memories(request=_request("alice"), session="bob-session", file=_upload()))
 
-    assert out["suggestions"] == [{"text": "Project Phoenix uses Python", "category": "project"}]
+    assert out["suggestions"] == [{"text": "Project Phoenix uses Python", "tags": [], "category": "project"}]
     session_manager.get_session.assert_called_once_with("bob-session")
     resolve_endpoint.assert_called_once_with("utility", owner="alice")
 
@@ -278,7 +278,7 @@ def test_import_owned_session_uses_session_endpoint(monkeypatch):
 
     out = asyncio.run(import_memories(request=_request("alice"), session="alice-session", file=_upload()))
 
-    assert out["suggestions"] == [{"text": "Project Phoenix uses Python", "category": "project"}]
+    assert out["suggestions"] == [{"text": "Project Phoenix uses Python", "tags": [], "category": "project"}]
     session_manager.get_session.assert_called_once_with("alice-session")
     resolve_task_endpoint.assert_called_once_with(
         "http://alice-llm",

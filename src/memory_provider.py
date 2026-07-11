@@ -9,12 +9,17 @@ from typing import Any, Dict, Iterable, List, Optional
 
 @dataclass
 class MemoryRecord:
-    """Provider-neutral memory entry."""
+    """Provider-neutral memory entry.
+
+    `category` is a computed legacy label (first tag); `tags` is the real
+    facet list.
+    """
 
     id: str
     text: str
     timestamp: int = 0
     category: str = "fact"
+    tags: List[str] = field(default_factory=list)
     source: str = "unknown"
     owner: Optional[str] = None
     session_id: Optional[str] = None
@@ -104,7 +109,7 @@ class NativeMemoryProvider(MemoryProvider):
         "text",
         "timestamp",
         "source",
-        "category",
+        "tags",
         "uses",
         "owner",
         "session_id",
@@ -125,11 +130,14 @@ class NativeMemoryProvider(MemoryProvider):
         if isinstance(stored_metadata, dict):
             metadata.update(stored_metadata)
 
+        from src.memory import compat_category
+
         return MemoryRecord(
             id=entry.get("id", ""),
             text=entry.get("text", ""),
             timestamp=entry.get("timestamp", 0),
-            category=entry.get("category", "fact"),
+            category=compat_category(entry),
+            tags=list(entry.get("tags") or []),
             source=entry.get("source", "unknown"),
             owner=entry.get("owner"),
             session_id=entry.get("session_id"),
@@ -143,12 +151,14 @@ class NativeMemoryProvider(MemoryProvider):
         owner: Optional[str] = None,
         session_id: Optional[str] = None,
         category: str = "fact",
+        tags: Optional[List[str]] = None,
         source: str = "user",
         metadata: Optional[Dict[str, Any]] = None,
     ) -> MemoryRecord:
         entry = self.memory_manager.add_entry(
             text,
             source=source,
+            tags=tags,
             category=category,
             owner=owner,
         )
@@ -157,9 +167,10 @@ class NativeMemoryProvider(MemoryProvider):
         if metadata:
             entry["metadata"] = dict(metadata)
 
-        memories = self.memory_manager.load_all()
-        memories.append(entry)
-        self.memory_manager.save(memories)
+        with self.memory_manager.lock:
+            memories = self.memory_manager.load_all()
+            memories.append(entry)
+            self.memory_manager.save(memories)
 
         if self._vector_available():
             self.memory_vector.add(entry["id"], entry["text"])
@@ -223,23 +234,24 @@ class NativeMemoryProvider(MemoryProvider):
         ]
 
     async def delete(self, memory_id: str, *, owner: Optional[str] = None) -> bool:
-        memories = self.memory_manager.load_all()
-        remaining = []
-        deleted_id = None
+        with self.memory_manager.lock:
+            memories = self.memory_manager.load_all()
+            remaining = []
+            deleted_id = None
 
-        for entry in memories:
-            if entry.get("id") != memory_id:
-                remaining.append(entry)
-                continue
-            if owner is not None and entry.get("owner") != owner:
-                remaining.append(entry)
-                continue
-            deleted_id = entry.get("id")
+            for entry in memories:
+                if entry.get("id") != memory_id:
+                    remaining.append(entry)
+                    continue
+                if owner is not None and entry.get("owner") != owner:
+                    remaining.append(entry)
+                    continue
+                deleted_id = entry.get("id")
 
-        if deleted_id is None:
-            return False
+            if deleted_id is None:
+                return False
 
-        self.memory_manager.save(remaining)
+            self.memory_manager.save(remaining)
         if self._vector_available():
             self.memory_vector.remove(deleted_id)
         return True

@@ -2,13 +2,73 @@
 import json
 import logging
 import os
+import threading
 import time
 import uuid
 import re
-from typing import List, Dict, Tuple
+from typing import List, Dict, Optional, Tuple
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
+
+# ── Tags ──
+# Memories carry free-form facet tags (max MAX_TAGS, normalized kebab-case).
+# Structured tags use one of the allowed prefixes, e.g. "person:sven".
+# Tags proposed by the tagging agent but not yet in the curator's registry live
+# in the entry's "provisional_tags" until a curator run promotes or merges them.
+
+MAX_TAGS = 10
+ALLOWED_TAG_PREFIXES = ("person", "place", "org", "project")
+
+_TAG_CHARS_RE = re.compile(r"[^a-z0-9:-]+")
+_HYPHENS_RE = re.compile(r"-{2,}")
+
+
+def normalize_tag(tag: str) -> Optional[str]:
+    """Normalize a single tag to kebab-case; None if nothing survives.
+
+    "Dress Code" -> "dress-code"; "Person: Sven" -> "person:sven".
+    A colon is only meaningful after an allowed prefix — otherwise it is
+    treated as a word separator so free-form input can't invent prefixes.
+    """
+    if not tag or not isinstance(tag, str):
+        return None
+    t = tag.strip().lower().replace("_", "-").replace(" ", "-")
+    t = _TAG_CHARS_RE.sub("", t)
+    prefix, sep, rest = t.partition(":")
+    if sep and prefix in ALLOWED_TAG_PREFIXES:
+        rest = _HYPHENS_RE.sub("-", rest.replace(":", "-")).strip("-")
+        t = f"{prefix}:{rest}" if rest else None
+    else:
+        t = _HYPHENS_RE.sub("-", t.replace(":", "-")).strip("-")
+    if not t or len(t) > 48:
+        return None
+    return t
+
+
+def normalize_tags(tags) -> List[str]:
+    """Normalize a tag collection: dedupe (order-preserving), cap at MAX_TAGS."""
+    if isinstance(tags, str):
+        tags = [tags]
+    out: List[str] = []
+    for tag in tags or []:
+        t = normalize_tag(tag)
+        if t and t not in out:
+            out.append(t)
+        if len(out) >= MAX_TAGS:
+            break
+    return out
+
+
+def compat_category(entry: Dict) -> str:
+    """Legacy 'category' for API/tool output, until the UI speaks tags (Phase 7).
+
+    After the category->tags migration the first tag IS the old category; once
+    the tagger adds richer tags this is only a best-effort label.
+    """
+    tags = entry.get("tags") or []
+    return tags[0] if tags else "fact"
+
 
 def tokenize(text: str) -> List[str]:
     """Simple tokenizer that splits on whitespace and removes punctuation."""
@@ -35,6 +95,12 @@ def get_text_similarity(text1: str, text2: str) -> float:
 class MemoryManager:
     def __init__(self, data_dir: str):
         self.memory_file = os.path.join(data_dir, "memory.json")
+        # Guards load-modify-save sequences. Saves are atomic (os.replace) but
+        # not transactional: the tagger, the curator, and increment_uses all
+        # mutate the same file, and an unguarded concurrent RMW loses writes.
+        # Everything runs in one process, so an RLock is enough; hold it around
+        # any load→mutate→save block (external callers use `with mm.lock:`).
+        self.lock = threading.RLock()
         self.ensure_file_exists()
         
     def extract_memory_from_chat(self, chat_history: List[Dict], session_id: str = None) -> List[Dict]:
@@ -135,20 +201,27 @@ class MemoryManager:
 
     def claim_ownerless(self, owner: str):
         """Assign all ownerless memory entries to the given owner."""
-        entries = self.load_all()
-        changed = False
-        claimed = 0
-        for entry in entries:
-            if not entry.get("owner"):
-                entry["owner"] = owner
-                changed = True
-                claimed += 1
-        if changed:
-            self.save(entries)
-            logger.info("Claimed %d ownerless memories for %s", claimed, owner)
+        with self.lock:
+            entries = self.load_all()
+            changed = False
+            claimed = 0
+            for entry in entries:
+                if not entry.get("owner"):
+                    entry["owner"] = owner
+                    changed = True
+                    claimed += 1
+            if changed:
+                self.save(entries)
+                logger.info("Claimed %d ownerless memories for %s", claimed, owner)
     
     def _validate_entries(self, entries: List[Dict]) -> List[Dict]:
-        """Ensure all entries have required fields."""
+        """Ensure all entries have required fields, migrating old-schema ones.
+
+        Lazy in-place migration from the pre-tags schema: a legacy `category`
+        value becomes the entry's first tag and the key is dropped. Persisted
+        on the next save. `generality: None` marks an entry as not yet triaged
+        by the curator; `tier` defaults to 2 (situational) until then.
+        """
         validated = []
         for entry in entries:
             if not isinstance(entry, dict):
@@ -159,10 +232,18 @@ class MemoryManager:
                 entry["timestamp"] = int(time.time())
             if "source" not in entry:
                 entry["source"] = "unknown"
-            if "category" not in entry:
-                entry["category"] = "fact"
             if "uses" not in entry:
                 entry["uses"] = 0
+            legacy_category = entry.pop("category", None)
+            tags = list(entry.get("tags") or [])
+            if legacy_category:
+                tags.append(legacy_category)
+            entry["tags"] = normalize_tags(tags)
+            entry.setdefault("provisional_tags", [])
+            entry.setdefault("pinned", False)
+            entry.setdefault("tier", 2)
+            entry.setdefault("generality", None)
+            entry.setdefault("last_used_at", 0)
             validated.append(entry)
         return validated
     
@@ -184,46 +265,52 @@ class MemoryManager:
                     "text": line,
                     "timestamp": int(time.time()),
                     "source": "user",
-                    "category": "fact"
                 })
-            
+
             self.save(entries)
-            return entries
+            return self._validate_entries(entries)
         except Exception as e:
             logger.error("Failed to convert legacy memory: %s", e)
             return []
     
     def save(self, entries: List[Dict]):
         """Save memory entries to JSON file."""
-        # Validate entries before saving
-        for entry in entries:
-            if "id" not in entry:
-                entry["id"] = str(uuid.uuid4())
-            if "timestamp" not in entry:
-                entry["timestamp"] = int(time.time())
-            if "source" not in entry:
-                entry["source"] = "user"
-            if "category" not in entry:
-                entry["category"] = "fact"
-        
-        # Use atomic write
-        tmp_file = self.memory_file + ".tmp"
-        with open(tmp_file, "w", encoding="utf-8") as f:
-            json.dump(entries, f, ensure_ascii=False, indent=2)
-        os.replace(tmp_file, self.memory_file)
-    
-    def add_entry(self, text: str, source: str = "user", category: str = "fact", owner: str = None) -> Dict:
-        """Add a new memory entry."""
+        entries = self._validate_entries(entries)
+
+        with self.lock:
+            # Use atomic write
+            tmp_file = self.memory_file + ".tmp"
+            with open(tmp_file, "w", encoding="utf-8") as f:
+                json.dump(entries, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_file, self.memory_file)
+
+    def add_entry(self, text: str, source: str = "user", tags: List[str] = None,
+                  owner: str = None, category: str = None) -> Dict:
+        """Build a new memory entry (not persisted — append + save yourself,
+        holding `self.lock` around the load-append-save).
+
+        `category` is a deprecated alias kept for old callers/imports; its
+        value is folded into `tags`.
+        """
         if not text.strip():
             raise ValueError("Memory text cannot be empty")
+
+        all_tags = list(tags or [])
+        if category:
+            all_tags.append(category)
 
         entry = {
             "id": str(uuid.uuid4()),
             "text": text.strip(),
             "timestamp": int(time.time()),
             "source": source,
-            "category": category,
+            "tags": normalize_tags(all_tags),
+            "provisional_tags": [],
+            "pinned": False,
+            "tier": 2,
+            "generality": None,
             "uses": 0,
+            "last_used_at": 0,
         }
         if owner:
             entry["owner"] = owner
@@ -235,14 +322,17 @@ class MemoryManager:
         if not ids:
             return
         id_set = set(ids)
-        entries = self.load_all()
-        changed = False
-        for e in entries:
-            if e.get("id") in id_set:
-                e["uses"] = int(e.get("uses", 0) or 0) + 1
-                changed = True
-        if changed:
-            self.save(entries)
+        now = int(time.time())
+        with self.lock:
+            entries = self.load_all()
+            changed = False
+            for e in entries:
+                if e.get("id") in id_set:
+                    e["uses"] = int(e.get("uses", 0) or 0) + 1
+                    e["last_used_at"] = now
+                    changed = True
+            if changed:
+                self.save(entries)
     
     def find_duplicates(self, text: str, entries: List[Dict] = None) -> List[Dict]:
         """Find duplicate memory entries based on text content."""
@@ -252,42 +342,6 @@ class MemoryManager:
         text_lower = text.strip().lower()
         return [entry for entry in entries if entry["text"].lower() == text_lower]
             
-    def categorize_memory_by_relevance(self, message: str, memories: list):
-        """Categorize memories by type and relevance"""
-        categories = {
-            "contacts": [],
-            "preferences": [],
-            "facts": [],
-            "tasks": []
-        }
-        
-        msg_lower = message.lower()
-        
-        for mem in memories:
-            text_lower = mem["text"].lower()
-            
-            # Contact info
-            if any(word in text_lower for word in ["phone", "email", "address", "lives", "works"]):
-                if any(word in msg_lower for word in ["contact", "phone", "address", "email"]):
-                    categories["contacts"].append(mem)
-            
-            # Personal preferences
-            elif any(word in text_lower for word in ["likes", "dislikes", "prefers", "favorite"]):
-                if any(word in msg_lower for word in ["like", "prefer", "favorite", "want"]):
-                    categories["preferences"].append(mem)
-            
-            # Tasks and todos
-            elif any(word in text_lower for word in ["todo", "task", "remind", "meeting"]):
-                if any(word in msg_lower for word in ["todo", "task", "schedule", "remind"]):
-                    categories["tasks"].append(mem)
-            
-            # General facts - only if very relevant
-            else:
-                if get_text_similarity(message, mem["text"]) > 0.4:
-                    categories["facts"].append(mem)
-        
-        return categories
-
     def get_relevant_memories(self, query: str, memories: list, threshold: float = 0.05, max_items: int = 8):
         """Get memories that are relevant to the query based on text similarity and semantic keyword matching."""
         if not memories or not query.strip():
