@@ -71,8 +71,11 @@ def setup_memory_routes(memory_manager: MemoryManager, session_manager: SessionM
     def _with_compat(memory: dict) -> dict:
         """Response copy carrying a computed legacy `category` field.
 
-        The memory UI still filters/badges on `category` (until the Phase 7
-        tags UI); storage is tags-only, so responses synthesize it.
+        Storage is tags-only; the memory page reads `tags`/`tier` directly
+        since Phase 7. `category` (= first tag) is kept as a one-release
+        back-compat alias for API consumers that never migrated (MCP
+        clients, old exports) — see the implementation plan's Phase 8
+        cleanup notes.
         """
         return {**memory, "category": compat_category(memory)}
 

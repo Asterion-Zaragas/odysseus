@@ -1242,6 +1242,9 @@ async def _startup_event():
     # `memory_curator_hour` (default 3). Each owner's run is independently
     # checkpointed/fingerprint-gated (services/memory/memory_curator.py), so
     # one slow or failing owner can't block the rest.
+    # Soak mode (Phase 8): `memory_curator_dry_run` defaults True, so nightly
+    # runs preview (real LLM calls, nothing saved) until an admin has watched
+    # a few nights of logged results and flips it off.
     async def _memory_curator_nightly_loop():
         from datetime import timedelta
         while True:
@@ -1259,11 +1262,13 @@ async def _startup_event():
                 from src.settings import get_setting
                 if not get_setting("memory_curator_nightly", True):
                     continue
+                dry_run = bool(get_setting("memory_curator_dry_run", True))
                 from services.memory.memory_curator import curate, list_owners
                 for owner in list_owners(memory_manager):
                     try:
-                        result = await curate(memory_manager, memory_vector, owner=owner, dry_run=False)
-                        logger.info(f"Nightly memory curation for {owner or '(legacy)'}: {result}")
+                        result = await curate(memory_manager, memory_vector, owner=owner, dry_run=dry_run)
+                        mode = "dry-run preview" if dry_run else "applied"
+                        logger.info(f"Nightly memory curation for {owner or '(legacy)'} ({mode}): {result}")
                     except Exception as e:
                         logger.warning(f"Nightly memory curation failed for {owner or '(legacy)'}: {e}")
             except Exception as e:

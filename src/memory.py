@@ -61,7 +61,9 @@ def normalize_tags(tags) -> List[str]:
 
 
 def compat_category(entry: Dict) -> str:
-    """Legacy 'category' for API/tool output, until the UI speaks tags (Phase 7).
+    """Legacy 'category' for API/tool output — one-release back-compat alias
+    for callers that never migrated to tags (MCP clients, old exports); the
+    memory page itself reads `tags`/`tier` directly since Phase 7.
 
     After the category->tags migration the first tag IS the old category; once
     the tagger adds richer tags this is only a best-effort label.

@@ -1,0 +1,205 @@
+[
+  {
+    "id": "t01-name",
+    "messages": [
+      {"role": "user", "content": "Hi, I'm Alex Rivera, nice to meet you."},
+      {"role": "assistant", "content": "Hi Alex, nice to meet you too!"}
+    ],
+    "golden_facts": [{"text": "User's name is Alex Rivera.", "durability": 0.95, "context_hint": "introducing themselves"}],
+    "category": "durable",
+    "notes": "clean identity disclosure"
+  },
+  {
+    "id": "t02-job",
+    "messages": [
+      {"role": "user", "content": "I work as a backend engineer at Acme Corp, mostly Python."},
+      {"role": "assistant", "content": "Cool, Python is great for backend."}
+    ],
+    "golden_facts": [{"text": "User is a backend engineer at Acme Corp, works mostly in Python.", "durability": 0.9, "context_hint": "talking about their job"}],
+    "category": "durable",
+    "notes": "job/employer disclosure"
+  },
+  {
+    "id": "t03-dietary",
+    "messages": [
+      {"role": "user", "content": "Btw I'm vegetarian and avoid dairy too."},
+      {"role": "assistant", "content": "Got it, I'll suggest vegetarian dairy-free recipes."}
+    ],
+    "golden_facts": [{"text": "User is vegetarian and avoids dairy.", "durability": 0.75, "context_hint": "discussing dietary preferences"}],
+    "category": "durable",
+    "notes": "dietary constraint"
+  },
+  {
+    "id": "t04-weather",
+    "messages": [
+      {"role": "user", "content": "Can you check tomorrow's weather?"},
+      {"role": "assistant", "content": "Sure, tomorrow looks sunny."}
+    ],
+    "golden_facts": [],
+    "category": "transient",
+    "notes": "a one-off request, not a durable fact about the user"
+  },
+  {
+    "id": "t05-mood",
+    "messages": [
+      {"role": "user", "content": "Ugh today has been so rough."},
+      {"role": "assistant", "content": "Sorry to hear that, want to talk about it?"}
+    ],
+    "golden_facts": [],
+    "category": "transient",
+    "notes": "transient mood, not durable"
+  },
+  {
+    "id": "t06-dislike-boundary",
+    "messages": [
+      {"role": "user", "content": "I really can't stand cilantro, please avoid it in recipes."},
+      {"role": "assistant", "content": "Noted, no cilantro."}
+    ],
+    "golden_facts": [{"text": "User dislikes cilantro.", "durability": 0.6, "context_hint": "discussing food preferences"}],
+    "category": "boundary_kept",
+    "notes": "durability exactly at DURABILITY_THRESHOLD (0.6) - must be KEPT (threshold is a strict '<' drop, not '<=')"
+  },
+  {
+    "id": "t07-low-durability-trivia",
+    "messages": [
+      {"role": "user", "content": "Anyway I saw a cool cloud shaped like a dog today lol"},
+      {"role": "assistant", "content": "Haha nice."}
+    ],
+    "golden_facts": [{"text": "User saw a cloud shaped like a dog.", "durability": 0.15, "context_hint": "small talk about clouds"}],
+    "category": "low_durability_dropped",
+    "notes": "fact-shaped but trivial - the model extracted it (imperfectly) but the code-side threshold must drop it"
+  },
+  {
+    "id": "t08-manager",
+    "messages": [
+      {"role": "user", "content": "My manager Priya has been really supportive lately."},
+      {"role": "assistant", "content": "That's great to hear."}
+    ],
+    "golden_facts": [{"text": "User's manager is Priya.", "durability": 0.8, "context_hint": "talking about their manager"}],
+    "category": "durable",
+    "notes": "durable relationship fact"
+  },
+  {
+    "id": "t09-travel-goal",
+    "messages": [
+      {"role": "user", "content": "I'm hoping to visit Japan next spring, super excited."},
+      {"role": "assistant", "content": "Japan in spring sounds amazing, cherry blossoms!"}
+    ],
+    "golden_facts": [{"text": "User wants to visit Japan next spring.", "durability": 0.65, "context_hint": "discussing travel plans"}],
+    "category": "durable",
+    "notes": "goal/plan fact"
+  },
+  {
+    "id": "t10-side-project",
+    "messages": [
+      {"role": "user", "content": "I've been building a little side project called Odysseus, a rocket tracker."},
+      {"role": "assistant", "content": "That sounds like a fun project!"}
+    ],
+    "golden_facts": [{"text": "User is building a side project called Odysseus, a rocket tracker.", "durability": 0.7, "context_hint": "talking about a side project"}],
+    "category": "durable",
+    "notes": "long-running project fact"
+  },
+  {
+    "id": "t11-current-task",
+    "messages": [
+      {"role": "user", "content": "Can you help me debug this stack trace?"},
+      {"role": "assistant", "content": "Sure, paste the trace."}
+    ],
+    "golden_facts": [],
+    "category": "transient",
+    "notes": "the current task itself is excluded, not a durable fact about the user"
+  },
+  {
+    "id": "t12-assistant-opinion",
+    "messages": [
+      {"role": "user", "content": "What's a good python web framework?"},
+      {"role": "assistant", "content": "FastAPI is great, I personally prefer it for new projects."}
+    ],
+    "golden_facts": [],
+    "category": "transient",
+    "notes": "the disclosed preference belongs to the ASSISTANT, not the user - must not be extracted as a user fact"
+  },
+  {
+    "id": "t13-phone",
+    "messages": [
+      {"role": "user", "content": "Also quick note, my phone number is 555-0142 if you ever need it."},
+      {"role": "assistant", "content": "Got it, saved for reference."}
+    ],
+    "golden_facts": [{"text": "User's phone number is 555-0142.", "durability": 0.7, "context_hint": "sharing contact info"}],
+    "category": "durable",
+    "notes": "contact info disclosure"
+  },
+  {
+    "id": "t14-speculation",
+    "messages": [
+      {"role": "user", "content": "I might maybe possibly get a dog someday, not sure."},
+      {"role": "assistant", "content": "Dogs are wonderful companions if you do!"}
+    ],
+    "golden_facts": [],
+    "category": "transient",
+    "notes": "speculative, not confidently stated - should not be extracted"
+  },
+  {
+    "id": "t15-two-facts",
+    "messages": [
+      {"role": "user", "content": "Quick two things: my partner's name is Jordan, and we live in Portland."},
+      {"role": "assistant", "content": "Nice, Portland's beautiful, and nice to know about Jordan!"}
+    ],
+    "golden_facts": [
+      {"text": "User's partner is named Jordan.", "durability": 0.85, "context_hint": "talking about their partner"},
+      {"text": "User lives in Portland.", "durability": 0.85, "context_hint": "talking about where they live"}
+    ],
+    "category": "durable",
+    "notes": "two durable facts in one turn, both should be kept (MAX 2/turn is a prompt-level guideline, not code-enforced)"
+  },
+  {
+    "id": "t16-allergy",
+    "messages": [
+      {"role": "user", "content": "Heads up, I have a peanut allergy so please avoid recipes with peanuts."},
+      {"role": "assistant", "content": "Understood, I'll avoid peanuts in any suggestions."}
+    ],
+    "golden_facts": [{"text": "User has a peanut allergy.", "durability": 0.95, "context_hint": "food safety constraint"}],
+    "category": "durable",
+    "notes": "safety-critical identity-level fact"
+  },
+  {
+    "id": "t17-hobby",
+    "messages": [
+      {"role": "user", "content": "I've been learning to play bass guitar in a cover band on weekends."},
+      {"role": "assistant", "content": "That's awesome, how's it going?"}
+    ],
+    "golden_facts": [{"text": "User plays bass guitar in a weekend cover band.", "durability": 0.65, "context_hint": "talking about a hobby"}],
+    "category": "durable",
+    "notes": "hobby fact"
+  },
+  {
+    "id": "t18-low-durability-oneoff",
+    "messages": [
+      {"role": "user", "content": "Quick one-off: how do I merge two pandas dataframes?"},
+      {"role": "assistant", "content": "You can use pd.merge(left, right, on='key')."}
+    ],
+    "golden_facts": [{"text": "User asked about merging pandas dataframes.", "durability": 0.1, "context_hint": "one-off coding question"}],
+    "category": "low_durability_dropped",
+    "notes": "a one-off technical question the model over-eagerly extracted - code threshold must drop it"
+  },
+  {
+    "id": "t19-dev-tool-boundary",
+    "messages": [
+      {"role": "user", "content": "I always use Neovim as my editor, can't live without it."},
+      {"role": "assistant", "content": "Neovim is a solid choice!"}
+    ],
+    "golden_facts": [{"text": "User uses Neovim as their primary code editor.", "durability": 0.6, "context_hint": "discussing dev tools"}],
+    "category": "boundary_kept",
+    "notes": "durability exactly at threshold - must be kept"
+  },
+  {
+    "id": "t20-mixed-batch",
+    "messages": [
+      {"role": "user", "content": "For the record: I'm training for a half marathon in October, and also, what's the weather like today?"},
+      {"role": "assistant", "content": "Good luck training! Today's sunny."}
+    ],
+    "golden_facts": [{"text": "User is training for a half marathon in October.", "durability": 0.6, "context_hint": "discussing fitness goals"}],
+    "category": "boundary_kept",
+    "notes": "one durable fact plus one transient question in the same turn - only the durable half should be extracted (well-behaved model already filters this; there is nothing for the code threshold to drop here since durability sits at the boundary)"
+  }
+]

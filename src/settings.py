@@ -165,6 +165,14 @@ DEFAULT_SETTINGS = {
     # lowest-count tags get merged when the cap is exceeded.
     "memory_tag_registry_cap": 50,
     "memory_curator_nightly": True,
+    # Soak-mode safety switch (Phase 8): the curator mutates every owner's real
+    # memory store nightly, so a fresh install starts in preview-only mode —
+    # nightly runs execute the full pipeline (real LLM calls, real changelog
+    # entries) but never save mutations, exactly like a manual "Preview (dry
+    # run)" from the memory page. Flip to False once a few nights of logged
+    # previews (`logger.info` in the nightly loop) look sane for your model
+    # pair and data.
+    "memory_curator_dry_run": True,
     # Local hour (0-23) the nightly curator loop targets, mirrors the skill-audit loop.
     "memory_curator_hour": 3,
     # Max entries per curator LLM sub-pass batch (never the whole store at once).

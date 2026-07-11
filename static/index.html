@@ -1595,6 +1595,10 @@
                 <input id="set-memoryCuratorHour" type="text" inputmode="numeric" placeholder="3" class="settings-select" style="width:382.5px;flex:0 0 auto;margin-left:auto;">
               </div>
               <div class="settings-row">
+                <label class="settings-label">Curator preview-only (soak mode)</label>
+                <span style="margin-left:auto;"><label class="admin-switch" title="Nightly curator runs the full pipeline for real (LLM calls, changelog entries) but never saves mutations — like manually clicking Preview. Turn off once a few nights of logged previews look right."><input type="checkbox" id="set-memoryCuratorDryRunToggle" checked><span class="admin-slider"></span></label></span>
+              </div>
+              <div class="settings-row">
                 <label class="settings-label">Curator batch size</label>
                 <input id="set-memoryCuratorBatch" type="text" inputmode="numeric" placeholder="25" class="settings-select" style="width:382.5px;flex:0 0 auto;margin-left:auto;">
               </div>

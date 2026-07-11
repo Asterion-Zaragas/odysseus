@@ -211,12 +211,30 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 break
         if not full_id:
             return _text_result(f"Error: Memory '{memory_id}' not found")
-        for m in memories:
-            if m.get("id") == full_id:
-                m["text"] = new_text
-                m["timestamp"] = int(time.time())
-                break
-        _memory_manager.save(memories)
+        with _memory_manager.lock:
+            for m in memories:
+                if m.get("id") == full_id:
+                    m["text"] = new_text
+                    m["timestamp"] = int(time.time())
+                    break
+            _memory_manager.save(memories)
+
+        # Re-tag from the new text (mirrors the memory-page PUT /{id} route
+        # and the manage_memory builtin tool's edit action): an edit changes
+        # what the memory is about, so tags/generality/tier must be
+        # recomputed too, or they silently drift from the text.
+        # interactive=True: this call runs inline inside the MCP request
+        # handling — waiting on interactive_gate's foreground-quiet check
+        # here would deadlock the request against itself.
+        from services.memory.memory_tagger import tag_memory, apply_tags
+        tag_result = await tag_memory(new_text, owner=_owner, interactive=True)
+        with _memory_manager.lock:
+            fresh = _memory_manager.load_all()
+            target = next((m for m in fresh if m.get("id") == full_id), None)
+            if target:
+                apply_tags(target, tag_result)
+                _memory_manager.save(fresh)
+
         if _memory_vector and _memory_vector.healthy and full_id:
             try:
                 _memory_vector.remove(full_id)

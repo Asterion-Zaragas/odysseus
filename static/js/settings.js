@@ -710,6 +710,7 @@ async function initMemoryModelSettings() {
 /* ── Memory System (registry cap, curator schedule, retrieval defaults) ── */
 async function initMemorySystemSettings() {
   var nightlyToggle = el('set-memoryCuratorNightlyToggle');
+  var dryRunToggle = el('set-memoryCuratorDryRunToggle');
   var registryCapInput = el('set-memoryRegistryCap');
   var curatorHourInput = el('set-memoryCuratorHour');
   var curatorBatchInput = el('set-memoryCuratorBatch');
@@ -724,6 +725,7 @@ async function initMemorySystemSettings() {
     var res = await fetch('/api/auth/settings', { credentials: 'same-origin' });
     var settings = await res.json();
     if (nightlyToggle) nightlyToggle.checked = settings.memory_curator_nightly !== false;
+    if (dryRunToggle) dryRunToggle.checked = settings.memory_curator_dry_run !== false;
     if (settings.memory_tag_registry_cap != null) registryCapInput.value = settings.memory_tag_registry_cap;
     if (settings.memory_curator_hour != null) curatorHourInput.value = settings.memory_curator_hour;
     if (settings.memory_curator_batch != null) curatorBatchInput.value = settings.memory_curator_batch;
@@ -735,6 +737,7 @@ async function initMemorySystemSettings() {
 
   async function saveMemorySystem() {
     var payload = { memory_curator_nightly: nightlyToggle ? nightlyToggle.checked : true };
+    payload.memory_curator_dry_run = dryRunToggle ? dryRunToggle.checked : true;
     var cap = parseInt(registryCapInput.value, 10);
     if (!isNaN(cap)) payload.memory_tag_registry_cap = cap;
     var hour = parseInt(curatorHourInput.value, 10);
@@ -756,7 +759,7 @@ async function initMemorySystemSettings() {
     } catch (e) { msg.textContent = 'Failed to save'; msg.style.color = 'var(--red)'; }
   }
 
-  [nightlyToggle, registryCapInput, curatorHourInput, curatorBatchInput, effortSelect, contextDocToggle, expiryDaysInput, protectedTagsInput]
+  [nightlyToggle, dryRunToggle, registryCapInput, curatorHourInput, curatorBatchInput, effortSelect, contextDocToggle, expiryDaysInput, protectedTagsInput]
     .forEach(function(input) { if (input) input.addEventListener('change', saveMemorySystem); });
 }
 

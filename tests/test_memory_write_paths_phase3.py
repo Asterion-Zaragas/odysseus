@@ -225,6 +225,33 @@ async def test_do_manage_memory_add_calls_tagger(ai_memory_manager, monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_do_manage_memory_edit_retags_from_new_text(ai_memory_manager, monkeypatch):
+    # Phase 8 fix: the edit action used to only touch text/timestamp and
+    # never re-tag, unlike the memory-page PUT /{id} route - tags/generality
+    # could silently drift from an edited memory's actual content.
+    import src.ai_interaction as ai
+
+    entry = ai_memory_manager.add_entry("Old text", tags=["fact"], owner="alice")
+    ai_memory_manager.save([entry])
+
+    calls = []
+    monkeypatch.setattr(
+        "services.memory.memory_tagger.tag_memory",
+        _fake_tag_memory(tags=["work"], generality=2, capture=calls),
+    )
+
+    result = await ai.do_manage_memory(f"edit\n{entry['id']}\nNew text", owner="alice")
+    assert result["results"] == "Memory updated: New text"
+
+    saved = ai_memory_manager.load(owner="alice")[0]
+    assert saved["text"] == "New text"
+    # merge semantics: old seeded tag survives alongside the tagger's new one
+    assert set(saved["tags"]) == {"fact", "work"}
+    assert saved["generality"] == 2
+    assert calls == [{"text": "New text", "owner": "alice", "interactive": True}]
+
+
+@pytest.mark.asyncio
 async def test_do_manage_memory_add_line3_tags_override(ai_memory_manager, monkeypatch):
     import src.ai_interaction as ai
 
@@ -344,3 +371,28 @@ async def test_mcp_memory_add_explicit_tags_override(mcp_memory_manager, monkeyp
     await ms.call_tool("manage_memory", {"action": "add", "text": "Prefers tea", "tags": ["preference"]})
     saved = mm.load_all()
     assert saved[0]["tags"] == ["preference"]
+
+
+@pytest.mark.asyncio
+async def test_mcp_memory_edit_retags_from_new_text(mcp_memory_manager, monkeypatch):
+    # Phase 8 fix: mirrors the manage_memory builtin and PUT /{id} route -
+    # the MCP edit action used to only touch text/timestamp and never re-tag.
+    mm, ms = mcp_memory_manager
+    monkeypatch.delenv("ODYSSEUS_MCP_MEMORY_OWNER", raising=False)
+    monkeypatch.delenv("ODYSSEUS_MEMORY_OWNER", raising=False)
+
+    entry = mm.add_entry("Old text", tags=["fact"])
+    mm.save([entry])
+
+    monkeypatch.setattr(
+        "services.memory.memory_tagger.tag_memory",
+        _fake_tag_memory(tags=["work"], generality=2),
+    )
+
+    result = await ms.call_tool("manage_memory", {"action": "edit", "memory_id": entry["id"][:8], "text": "New text"})
+    assert result[0].text == "Memory updated: New text"
+
+    saved = mm.load_all()[0]
+    assert saved["text"] == "New text"
+    assert set(saved["tags"]) == {"fact", "work"}
+    assert saved["generality"] == 2

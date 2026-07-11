@@ -442,6 +442,21 @@ async def do_manage_memory(content: str, session_id: Optional[str] = None, owner
                 return {"error": f"Memory '{memory_id}' not found"}
             _memory_manager.save(memories)
 
+        # Re-tag from the new text (mirrors the memory-page PUT /{id} route):
+        # an edit changes what the memory is about, so its tags/generality/
+        # tier must be recomputed too, or they silently drift from the text.
+        # interactive=True: this tool call runs inline inside the chat/agent
+        # request's own tracked HTTP handling — waiting on interactive_gate's
+        # foreground-quiet check here would deadlock the request against itself.
+        from services.memory.memory_tagger import tag_memory, apply_tags
+        tag_result = await tag_memory(new_text, owner=owner, interactive=True)
+        with _memory_manager.lock:
+            memories = _memory_manager.load_all()
+            target = next((m for m in memories if m["id"] == full_id), None)
+            if target:
+                apply_tags(target, tag_result)
+                _memory_manager.save(memories)
+
         # Update vector index
         if _memory_vector and hasattr(_memory_vector, 'healthy') and _memory_vector.healthy:
             try:
