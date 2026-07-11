@@ -4,6 +4,7 @@
 import uiModule from './ui.js';
 import sessionModule from './sessions.js';
 import spinnerModule from './spinner.js';
+import markdownModule from './markdown.js';
 import { makeWindowDraggable } from './windowDrag.js';
 import { snapModalToZone } from './tileManager.js';
 import { topPortalZ } from './toolWindowZOrder.js';
@@ -11,7 +12,9 @@ import { topPortalZ } from './toolWindowZOrder.js';
 var escapeHtml = uiModule.esc;
 
 let memories = [];
-let activeCategory = 'all';
+let activeTag = 'all';
+let activeTier = 'all';
+let provisionalOnly = false;
 let sortOrder = 'newest';
 let selectMode = false;
 let selectedIds = new Set();
@@ -19,6 +22,11 @@ let memoriesLoading = false;
 
 
 const MEMORY_CATEGORIES = ['fact', 'identity', 'preference', 'contact', 'project', 'goal', 'task'];
+// Tags whose name matches a pre-tags-upgrade category keep that category's
+// CSS color (via .memory-cat-<name>, defined in style.css) — everything
+// else falls back to the generic gray .memory-cat-badge look.
+const _KNOWN_TAG_COLOR_CLASSES = new Set(MEMORY_CATEGORIES);
+const MEMORY_TIER_NAMES = { 0: 'core', 1: 'durable', 2: 'situational', 3: 'archive' };
 
 // Sort-option icons for the custom Memory sort picker (and Skills picker
 // once it reuses the same markup). Each value maps to a 13px Feather-style
@@ -156,23 +164,25 @@ function relativeTime(timestamp) {
 
 function buildCategoryChips() {
   const container = document.getElementById('memory-category-filters');
+  buildTierFilterChips();
   if (!container) return;
 
   // Hide the chip row entirely when there are no memories — no point showing
   // an "all" chip with nothing to filter.
   if (!memories.length) { container.innerHTML = ''; return; }
 
-  const cats = new Set(memories.map(m => m.category || 'fact'));
-  const sorted = ['all', ...Array.from(cats).sort()];
+  const tags = new Set();
+  memories.forEach(m => (m.tags && m.tags.length ? m.tags : [m.category || 'fact']).forEach(t => tags.add(t)));
+  const sorted = ['all', ...Array.from(tags).sort()];
 
   container.innerHTML = '';
-  sorted.forEach(cat => {
+  sorted.forEach(tag => {
     const btn = document.createElement('button');
-    btn.className = 'memory-cat-chip' + (cat === activeCategory ? ' active' : '');
-    btn.dataset.cat = cat;
-    btn.textContent = cat;
+    btn.className = 'memory-cat-chip' + (tag === activeTag ? ' active' : '');
+    btn.dataset.tag = tag;
+    btn.textContent = tag;
     btn.addEventListener('click', () => {
-      activeCategory = cat;
+      activeTag = tag;
       container.querySelectorAll('.memory-cat-chip').forEach(b => b.classList.remove('active'));
       btn.classList.add('active');
       renderMemoryList();
@@ -180,6 +190,64 @@ function buildCategoryChips() {
     });
     container.appendChild(btn);
   });
+}
+
+function buildTierFilterChips() {
+  const container = document.getElementById('memory-tier-filters');
+  if (!container) return;
+  if (!memories.length) { container.innerHTML = ''; return; }
+
+  container.innerHTML = '';
+  ['all', 0, 1, 2, 3].forEach(tier => {
+    const value = String(tier);
+    const label = tier === 'all' ? 'all tiers' : MEMORY_TIER_NAMES[tier];
+    const btn = document.createElement('button');
+    btn.className = 'memory-cat-chip' + (activeTier === value ? ' active' : '');
+    btn.dataset.tier = value;
+    btn.textContent = label;
+    btn.addEventListener('click', () => {
+      activeTier = value;
+      container.querySelectorAll('[data-tier]').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      renderMemoryList();
+      updateMemoryCount();
+    });
+    container.appendChild(btn);
+  });
+
+  const provBtn = document.createElement('button');
+  provBtn.className = 'memory-cat-chip' + (provisionalOnly ? ' active' : '');
+  provBtn.textContent = 'provisional only';
+  provBtn.title = 'Show only memories with tags the curator hasn\'t confirmed yet';
+  provBtn.addEventListener('click', () => {
+    provisionalOnly = !provisionalOnly;
+    provBtn.classList.toggle('active', provisionalOnly);
+    renderMemoryList();
+    updateMemoryCount();
+  });
+  container.appendChild(provBtn);
+}
+
+function _tagPillClass(tag) {
+  return 'memory-cat-badge memory-tag-pill' + (_KNOWN_TAG_COLOR_CLASSES.has(tag) ? ' memory-cat-' + tag : '');
+}
+
+function _makeTagPill(tag, provisional) {
+  const el = document.createElement('button');
+  el.type = 'button';
+  el.className = _tagPillClass(tag) + (provisional ? ' memory-tag-provisional' : '');
+  el.textContent = tag;
+  el.title = provisional
+    ? `${tag} — provisional, not yet confirmed by the curator`
+    : `Filter by "${tag}"`;
+  el.addEventListener('click', (e) => {
+    e.stopPropagation();
+    activeTag = tag;
+    buildCategoryChips();
+    renderMemoryList();
+    updateMemoryCount();
+  });
+  return el;
 }
 
 async function syncToggles() {
@@ -649,6 +717,182 @@ async function animateTidyDiff(removedIds, editedItems) {
   }
 }
 
+// ---- Curator tab: dry-run preview, manual run, changelog, context doc ----
+
+async function runCuratorPreview() {
+  const btn = document.getElementById('memory-curator-preview-btn');
+  const resultEl = document.getElementById('memory-curator-preview-result');
+  if (btn) { btn.disabled = true; btn.textContent = 'Previewing…'; }
+  try {
+    const res = await fetch(`${window.location.origin}/api/memory/audit`, {
+      method: 'POST',
+      body: new URLSearchParams({ dry_run: 'true' })
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || 'Preview failed');
+    }
+    const data = await res.json();
+    if (resultEl) {
+      resultEl.classList.remove('hidden');
+      resultEl.textContent = data.already_tidy
+        ? 'Preview: already clean — nothing to do.'
+        : `Preview: would remove ${data.removed} (${data.before} → ${data.after}). Nothing was saved — click "Run curator" to apply.`;
+    }
+  } catch (error) {
+    console.error('Curator preview failed:', error);
+    showError('Curator preview failed — check console');
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = 'Preview (dry run)'; }
+  }
+}
+
+async function runCuratorApply() {
+  // No confirmation dialog — mirrors the Browse tab's "Tidy" button, which
+  // is the same /api/memory/audit (dry_run=false) call under a different label.
+  const btn = document.getElementById('memory-curator-run-btn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Running…'; }
+  try {
+    const res = await fetch(`${window.location.origin}/api/memory/audit`, { method: 'POST' });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || 'Curator run failed');
+    }
+    const data = await res.json();
+    showToast(data.already_tidy || !data.removed
+      ? 'Already clean'
+      : `Curator: ${data.removed} removed (${data.before} → ${data.after})`);
+    await Promise.all([loadCuratorLog(), loadContextDoc(), loadMemories()]);
+  } catch (error) {
+    console.error('Curator run failed:', error);
+    showError('Curator run failed — check console');
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = 'Run curator'; }
+  }
+}
+
+async function loadCuratorLog() {
+  const summaryEl = document.getElementById('memory-curator-summary');
+  const logEl = document.getElementById('memory-curator-log');
+  if (!summaryEl || !logEl) return;
+  try {
+    const res = await fetch(`${window.location.origin}/api/memory/curation-log?limit=50`);
+    if (!res.ok) throw new Error(`status ${res.status}`);
+    const data = await res.json();
+    const entries = (data.log || []).slice().reverse(); // newest first
+    renderCuratorSummary(entries, summaryEl);
+    renderCuratorLogList(entries, logEl);
+  } catch (error) {
+    console.error('Failed to load curation log:', error);
+    summaryEl.innerHTML = '';
+    logEl.innerHTML = '<div class="memory-empty">Failed to load curator history.</div>';
+  }
+}
+
+function renderCuratorSummary(entries, container) {
+  if (!entries.length) { container.innerHTML = ''; return; }
+  const counts = {};
+  entries.forEach(e => { counts[e.action] = (counts[e.action] || 0) + 1; });
+  container.innerHTML = '';
+  Object.keys(counts).sort().forEach(action => {
+    const chip = document.createElement('span');
+    chip.className = 'memory-curator-stat';
+    chip.textContent = `${action}: ${counts[action]}`;
+    container.appendChild(chip);
+  });
+}
+
+function _describeCuratorAction(entry) {
+  const text = (entry.after && entry.after.text) || (entry.before && entry.before.text);
+  if (text) return text;
+  const tags = (entry.after && entry.after.tags) || (entry.before && entry.before.tags);
+  if (tags && tags.length) return tags.join(', ');
+  return entry.action || '';
+}
+
+function renderCuratorLogList(entries, container) {
+  container.innerHTML = '';
+  if (!entries.length) {
+    container.innerHTML = '<div class="memory-empty">No curator activity yet — it runs nightly, or trigger a run above.</div>';
+    return;
+  }
+  entries.forEach(entry => {
+    const row = document.createElement('div');
+    row.className = 'memory-curator-log-item';
+
+    const badge = document.createElement('span');
+    badge.className = 'memory-curator-log-action action-' + (entry.action || 'unknown');
+    badge.textContent = entry.action || 'unknown';
+    row.appendChild(badge);
+
+    const detail = document.createElement('span');
+    detail.className = 'memory-curator-log-detail';
+    detail.textContent = _describeCuratorAction(entry);
+    detail.title = detail.textContent;
+    row.appendChild(detail);
+
+    if (entry.ts) {
+      const time = document.createElement('span');
+      time.className = 'memory-curator-log-time';
+      time.textContent = relativeTime(Math.floor(entry.ts));
+      time.title = new Date(entry.ts * 1000).toLocaleString();
+      row.appendChild(time);
+    }
+
+    if (entry.action === 'expire' && entry.before && entry.before.id) {
+      const undoBtn = document.createElement('button');
+      undoBtn.className = 'memory-item-btn memory-curator-log-undo';
+      undoBtn.textContent = 'undo';
+      undoBtn.addEventListener('click', () => undoCuratorExpire(entry.before.id, undoBtn));
+      row.appendChild(undoBtn);
+    }
+
+    container.appendChild(row);
+  });
+}
+
+async function undoCuratorExpire(memoryId, btn) {
+  if (btn) { btn.disabled = true; btn.textContent = '…'; }
+  try {
+    const res = await fetch(`${window.location.origin}/api/memory/curation-log/undo`, {
+      method: 'POST',
+      body: new URLSearchParams({ memory_id: memoryId })
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || 'Undo failed');
+    }
+    showToast('Memory restored');
+    await Promise.all([loadCuratorLog(), loadMemories()]);
+  } catch (error) {
+    console.error('Undo failed:', error);
+    showError('Undo failed — check console');
+    if (btn) { btn.disabled = false; btn.textContent = 'undo'; }
+  }
+}
+
+async function loadContextDoc() {
+  const body = document.getElementById('memory-context-doc-body');
+  const updatedEl = document.getElementById('memory-context-doc-updated');
+  if (!body) return;
+  try {
+    const res = await fetch(`${window.location.origin}/api/memory/context-doc`);
+    if (!res.ok) throw new Error(`status ${res.status}`);
+    const data = await res.json();
+    body.innerHTML = markdownModule.mdToHtml(data.markdown || '');
+    if (updatedEl) updatedEl.textContent = data.updated_at ? `Updated ${relativeTime(data.updated_at)}` : '';
+  } catch (error) {
+    console.error('Failed to load context doc:', error);
+    body.innerHTML = '<div class="memory-empty">Failed to load context doc.</div>';
+    if (updatedEl) updatedEl.textContent = '';
+  }
+}
+
+function loadCuratorTab() {
+  loadCuratorLog();
+  loadContextDoc();
+}
+
 // ---- Filtering helper ----
 
 function getFilteredMemories() {
@@ -658,8 +902,14 @@ function getFilteredMemories() {
     ? memories.filter(m => m.text && m.text.toLowerCase().includes(searchTerm))
     : [...memories];
 
-  if (activeCategory !== 'all') {
-    filtered = filtered.filter(m => (m.category || 'fact') === activeCategory);
+  if (activeTag !== 'all') {
+    filtered = filtered.filter(m => (m.tags && m.tags.length ? m.tags : [m.category || 'fact']).includes(activeTag));
+  }
+  if (activeTier !== 'all') {
+    filtered = filtered.filter(m => String(Number.isFinite(m.tier) ? m.tier : 2) === activeTier);
+  }
+  if (provisionalOnly) {
+    filtered = filtered.filter(m => (m.provisional_tags || []).length > 0);
   }
 
   const sortSelect = document.getElementById('memory-sort');
@@ -704,7 +954,7 @@ export function renderMemoryList() {
     }
     const searchTerm = document.getElementById('memory-search')?.value?.trim() || '';
     const _smiley = '<span style="vertical-align:-3px;margin-left:6px;">' + uiModule.emptyStateIcon('smiley') + '</span>';
-    if (searchTerm || activeCategory !== 'all') {
+    if (searchTerm || activeTag !== 'all' || activeTier !== 'all' || provisionalOnly) {
       memoryList.innerHTML = `<div class="memory-empty">No matches.</div>`;
     } else {
       memoryList.innerHTML = `<div class="memory-empty" style="display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;">
@@ -767,11 +1017,16 @@ export function renderMemoryList() {
       meta.appendChild(pinBadge);
     }
 
-    const catBadge = document.createElement('span');
-    const cat = memory.category || 'fact';
-    catBadge.className = 'memory-cat-badge memory-cat-' + cat;
-    catBadge.textContent = cat;
-    meta.appendChild(catBadge);
+    const tier = Number.isFinite(memory.tier) ? memory.tier : 2;
+    const tierBadge = document.createElement('span');
+    tierBadge.className = 'memory-tier-badge memory-tier-' + tier;
+    tierBadge.textContent = MEMORY_TIER_NAMES[tier] || 'situational';
+    tierBadge.title = `Tier ${tier}: ${MEMORY_TIER_NAMES[tier] || 'situational'}`;
+    meta.appendChild(tierBadge);
+
+    const tags = memory.tags && memory.tags.length ? memory.tags : [memory.category || 'fact'];
+    tags.forEach(tag => meta.appendChild(_makeTagPill(tag, false)));
+    (memory.provisional_tags || []).forEach(tag => meta.appendChild(_makeTagPill(tag, true)));
 
     const srcSpan = document.createElement('span');
     srcSpan.className = 'memory-item-source';
@@ -995,18 +1250,15 @@ function startInlineEdit(item, memory) {
   input.className = 'memory-item-edit-input';
   input.value = memory.text;
 
-  const catSelect = document.createElement('select');
-  catSelect.className = 'memory-edit-cat-select';
-  MEMORY_CATEGORIES.forEach(cat => {
-    const opt = document.createElement('option');
-    opt.value = cat;
-    opt.textContent = cat;
-    if (cat === (memory.category || 'fact')) opt.selected = true;
-    catSelect.appendChild(opt);
-  });
+  const tagsInput = document.createElement('input');
+  tagsInput.type = 'text';
+  tagsInput.className = 'memory-edit-tags-input';
+  tagsInput.value = (memory.tags || []).join(', ');
+  tagsInput.placeholder = 'tags, comma-separated';
+  tagsInput.title = 'Comma-separated tags. Clear this field to let the tagger re-derive tags from the text instead.';
 
   editRow.appendChild(input);
-  editRow.appendChild(catSelect);
+  editRow.appendChild(tagsInput);
 
   const actions = document.createElement('div');
   actions.className = 'memory-item-actions';
@@ -1015,7 +1267,7 @@ function startInlineEdit(item, memory) {
   const saveBtn = document.createElement('button');
   saveBtn.className = 'memory-item-btn save';
   saveBtn.textContent = 'save';
-  saveBtn.addEventListener('click', () => saveInlineEdit(memory.id, input.value, catSelect.value));
+  saveBtn.addEventListener('click', () => saveInlineEdit(memory.id, input.value, tagsInput.value));
 
   const cancelBtn = document.createElement('button');
   cancelBtn.className = 'memory-item-btn';
@@ -1031,30 +1283,36 @@ function startInlineEdit(item, memory) {
   input.focus();
   input.select();
 
-  input.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') saveInlineEdit(memory.id, input.value, catSelect.value);
+  const _onEditKeydown = (e) => {
+    if (e.key === 'Enter') saveInlineEdit(memory.id, input.value, tagsInput.value);
     if (e.key === 'Escape') {
       e.stopPropagation();
       e.stopImmediatePropagation();
       renderMemoryList();
     }
-  });
+  };
+  input.addEventListener('keydown', _onEditKeydown);
+  tagsInput.addEventListener('keydown', _onEditKeydown);
 }
 
-async function saveInlineEdit(id, newText, newCategory) {
+async function saveInlineEdit(id, newText, tagsCsv) {
   newText = newText.trim();
   if (!newText) return;
 
   const memory = memories.find(m => m.id === id);
-  const catChanged = newCategory && newCategory !== (memory?.category || 'fact');
-  if (!memory || (newText === memory.text && !catChanged)) {
+  const newTags = (tagsCsv || '').split(',').map(t => t.trim()).filter(Boolean);
+  const tagsChanged = newTags.length > 0 && newTags.join(',') !== (memory?.tags || []).join(',');
+  if (!memory || (newText === memory.text && !tagsChanged)) {
     renderMemoryList();
     return;
   }
 
   try {
     const params = new URLSearchParams({ text: newText });
-    if (newCategory) params.append('category', newCategory);
+    // An empty tags field means "let the tagger re-derive from the new
+    // text" (route re-tags + merges) rather than "clear all tags" — there's
+    // no way to explicitly blank a memory's tags from this control.
+    if (newTags.length > 0) params.append('tags', newTags.join(','));
 
     const response = await fetch(`${window.location.origin}/api/memory/${id}`, {
       method: 'PUT',
@@ -1092,8 +1350,14 @@ export function updateMemoryCount() {
   if (searchTerm) {
     visible = visible.filter(m => m.text && m.text.toLowerCase().includes(searchTerm));
   }
-  if (activeCategory !== 'all') {
-    visible = visible.filter(m => (m.category || 'fact') === activeCategory);
+  if (activeTag !== 'all') {
+    visible = visible.filter(m => (m.tags && m.tags.length ? m.tags : [m.category || 'fact']).includes(activeTag));
+  }
+  if (activeTier !== 'all') {
+    visible = visible.filter(m => String(Number.isFinite(m.tier) ? m.tier : 2) === activeTier);
+  }
+  if (provisionalOnly) {
+    visible = visible.filter(m => (m.provisional_tags || []).length > 0);
   }
 
   const num = visible.length === scopeTotal ? `${scopeTotal}` : `${visible.length}/${scopeTotal}`;
@@ -1479,6 +1743,7 @@ document.addEventListener('DOMContentLoaded', () => {
       if (target === 'skills') {
         import('./skills.js').then(m => { if (m.loadSkills) m.loadSkills(true); else if (m.default?.loadSkills) m.default.loadSkills(true); });
       }
+      if (target === 'curator') loadCuratorTab();
     });
   });
 
@@ -1493,6 +1758,15 @@ document.addEventListener('DOMContentLoaded', () => {
 
   const tidyBtn = document.getElementById('memory-tidy-btn');
   if (tidyBtn) tidyBtn.addEventListener('click', tidyMemories);
+
+  const curatorPreviewBtn = document.getElementById('memory-curator-preview-btn');
+  if (curatorPreviewBtn) curatorPreviewBtn.addEventListener('click', runCuratorPreview);
+
+  const curatorRunBtn = document.getElementById('memory-curator-run-btn');
+  if (curatorRunBtn) curatorRunBtn.addEventListener('click', runCuratorApply);
+
+  const contextDocRefreshBtn = document.getElementById('memory-context-doc-refresh-btn');
+  if (contextDocRefreshBtn) contextDocRefreshBtn.addEventListener('click', loadContextDoc);
 
   const selectBtn = document.getElementById('memory-select-btn');
   if (selectBtn) selectBtn.addEventListener('click', () => {

@@ -28,6 +28,7 @@ from src.request_models import MemoryAddRequest
 from core.database import SessionLocal
 from src.llm_core import llm_call_async
 from services.memory.memory_curator import curate, read_curation_log, undo_expire
+from services.memory.memory_context import MemoryContext
 from src.auth_helpers import get_current_user, require_user
 from src.endpoint_resolver import resolve_endpoint
 from src.task_endpoint import resolve_task_endpoint
@@ -340,9 +341,27 @@ def setup_memory_routes(memory_manager: MemoryManager, session_manager: SessionM
     @router.get("/curation-log")
     def get_curation_log(request: Request, limit: int = 100):
         """Recent curator changelog entries for the caller (merge/retag/
-        demote/promote/expire), most recent last."""
+        demote/promote/expire), most recent last. Dry-run entries are
+        excluded — they were never applied, so the curator panel would
+        otherwise show phantom actions with no matching store change."""
         user = _owner(request)
-        return {"log": read_curation_log(user, limit=limit)}
+        return {"log": read_curation_log(user, limit=limit, include_dry_run=False)}
+
+    @router.get("/context-doc")
+    def get_context_doc(request: Request):
+        """The caller's curator-maintained memory context document: core
+        facts + tag registry, plus a markdown render for read-only display.
+        Cold start (curator has never run for this owner) returns an empty
+        document, not a 404 — there's nothing wrong, just nothing yet."""
+        user = _owner(request)
+        ctx = MemoryContext(user)
+        doc = ctx.load()
+        return {
+            "markdown": ctx.render_markdown(),
+            "core_facts": doc.get("core_facts") or [],
+            "tag_registry": doc.get("tag_registry") or [],
+            "updated_at": doc.get("updated_at") or 0,
+        }
 
     @router.post("/curation-log/undo")
     def undo_curation_action(request: Request, memory_id: str = Form(...)):

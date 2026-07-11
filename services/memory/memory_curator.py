@@ -134,7 +134,13 @@ def _log_action(owner: Optional[str], action: str, before=None, after=None, dry_
         logger.warning("Could not write curation log for owner=%r: %s", owner, e)
 
 
-def read_curation_log(owner: Optional[str], limit: int = 100) -> List[Dict]:
+def read_curation_log(owner: Optional[str], limit: int = 100, include_dry_run: bool = True) -> List[Dict]:
+    """`include_dry_run=False` hides `dry_run:true` lines — a dry run logs
+    every proposed action for debugging, but those actions were never
+    actually applied, so a caller presenting this as "what the curator did"
+    (the Phase 7 curator panel) must exclude them or it shows phantom
+    merges/expiries and could offer to "undo" one. Defaults to True to keep
+    existing callers/tests (which want the full raw log) unchanged."""
     path = _log_path(owner)
     if not os.path.exists(path):
         return []
@@ -152,6 +158,8 @@ def read_curation_log(owner: Optional[str], limit: int = 100) -> List[Dict]:
     except OSError as e:
         logger.warning("Could not read curation log for owner=%r: %s", owner, e)
         return []
+    if not include_dry_run:
+        lines = [l for l in lines if not l.get("dry_run")]
     return lines[-limit:] if limit else lines
 
 
@@ -162,7 +170,7 @@ def undo_expire(memory_manager, memory_vector, owner: Optional[str], memory_id: 
     (either just restored, or it was already there — a safe no-op).
     """
     snapshot = None
-    for rec in reversed(read_curation_log(owner, limit=0)):
+    for rec in reversed(read_curation_log(owner, limit=0, include_dry_run=False)):
         before = rec.get("before")
         if rec.get("action") == "expire" and isinstance(before, dict) and before.get("id") == memory_id:
             snapshot = before

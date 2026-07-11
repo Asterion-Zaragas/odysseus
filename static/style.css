@@ -12448,6 +12448,160 @@ textarea.memory-add-input {
   background: color-mix(in srgb, var(--red) 3%, transparent);
 }
 
+/* ── Phase 7: tier badges, tag pills, curator panel, context-doc viewer ── */
+
+.memory-tier-filters {
+  margin-top: 2px;
+}
+
+/* Item-level tag pills — reuse the .memory-cat-badge look (per-tag color
+   when the tag matches a legacy category name, generic gray otherwise) but
+   clickable, since clicking a pill filters the list to that tag. */
+.memory-tag-pill {
+  cursor: pointer;
+  border: none;
+  font-family: inherit;
+}
+.memory-tag-pill:hover {
+  filter: brightness(1.25);
+}
+.memory-tag-pill.memory-tag-provisional {
+  background: transparent;
+  border: 1px dashed color-mix(in srgb, var(--fg) 30%, transparent);
+  color: color-mix(in srgb, var(--fg) 45%, transparent);
+}
+.memory-tag-pill.memory-tag-provisional:hover {
+  border-color: var(--accent, var(--red));
+  color: var(--accent, var(--red));
+  filter: none;
+}
+
+/* Tier badge — one per item, colored core (most durable) -> archive (least). */
+.memory-tier-badge {
+  font-size: 10px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  text-transform: lowercase;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+.memory-tier-0 {
+  background: color-mix(in srgb, var(--red) 18%, transparent);
+  color: var(--red);
+}
+.memory-tier-1 {
+  background: color-mix(in srgb, var(--hl-function) 15%, transparent);
+  color: var(--hl-function);
+}
+.memory-tier-2 {
+  background: color-mix(in srgb, var(--fg) 8%, transparent);
+  color: color-mix(in srgb, var(--fg) 55%, transparent);
+  font-weight: 500;
+}
+.memory-tier-3 {
+  background: color-mix(in srgb, var(--fg) 5%, transparent);
+  color: color-mix(in srgb, var(--fg) 35%, transparent);
+  font-weight: 500;
+}
+
+/* Inline-edit tags field (replaces the old single category <select>) */
+.memory-edit-tags-input {
+  flex: 1;
+  min-width: 0;
+  background: var(--input-bg, var(--panel));
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 8px;
+  font-size: 12px;
+  font-family: inherit;
+}
+.memory-edit-tags-input:focus {
+  outline: none;
+  border-color: var(--red);
+}
+
+/* Curator panel */
+.memory-curator-summary {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+}
+.memory-curator-summary:empty { display: none; }
+.memory-curator-stat {
+  font-size: 10px;
+  padding: 3px 8px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--fg) 6%, transparent);
+  color: color-mix(in srgb, var(--fg) 65%, transparent);
+  text-transform: lowercase;
+}
+.memory-curator-preview-result {
+  margin-top: 8px;
+  padding: 8px 10px;
+  border: 1px solid color-mix(in srgb, var(--hl-function) 35%, var(--border));
+  background: color-mix(in srgb, var(--hl-function) 6%, transparent);
+  border-radius: 6px;
+  font-size: 12px;
+}
+.memory-curator-preview-result.hidden { display: none; }
+.memory-curator-log {
+  margin-top: 8px;
+  max-height: 280px;
+}
+.memory-curator-log-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+}
+.memory-curator-log-action {
+  font-size: 10px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--fg) 8%, transparent);
+  color: color-mix(in srgb, var(--fg) 60%, transparent);
+  text-transform: lowercase;
+  flex-shrink: 0;
+}
+.memory-curator-log-action.action-expire { background: color-mix(in srgb, var(--red) 15%, transparent); color: var(--red); }
+.memory-curator-log-action.action-merge,
+.memory-curator-log-action.action-dedupe { background: color-mix(in srgb, var(--hl-string) 15%, transparent); color: var(--hl-string); }
+.memory-curator-log-action.action-promote { background: color-mix(in srgb, #98c379 15%, transparent); color: #98c379; }
+.memory-curator-log-action.action-demote { background: color-mix(in srgb, #d19a66 15%, transparent); color: #d19a66; }
+.memory-curator-log-detail {
+  flex: 1;
+  min-width: 0;
+  font-size: 11px;
+  color: color-mix(in srgb, var(--fg) 60%, transparent);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.memory-curator-log-time {
+  font-size: 9px;
+  color: color-mix(in srgb, var(--fg) 35%, transparent);
+  flex-shrink: 0;
+}
+.memory-curator-log-undo {
+  flex-shrink: 0;
+}
+
+/* Context-doc viewer — read-only markdown render */
+.memory-context-doc-body {
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-y: auto;
+  max-height: 360px;
+}
+.memory-context-doc-body h1 { font-size: 14px; margin: 0 0 8px; }
+.memory-context-doc-body h2 { font-size: 12px; margin: 14px 0 6px; opacity: 0.8; text-transform: uppercase; letter-spacing: 0.03em; }
+.memory-context-doc-body h2:first-child { margin-top: 0; }
+.memory-context-doc-body ul { margin: 0 0 4px; padding-left: 18px; }
+.memory-context-doc-body li { margin: 2px 0; }
+.memory-context-doc-body p { margin: 4px 0; opacity: 0.6; }
+
 /* Tidy animations */
 .memory-tidy-editing {
   border-color: color-mix(in srgb, var(--hl-function) 40%, transparent);
@@ -16948,6 +17102,16 @@ body:not(.email-doc-split-active) #email-lib-modal.email-lib-fullscreen:not(.mod
 .memory-toolbar.cookbook-servers-toolbar {
   max-height: none;
   overflow: visible;
+}
+/* The memory Browse tab's toolbar grew a 4th row (tier/provisional filter
+   chips, Phase 7) — the shared 120px cap above (tuned for every OTHER list
+   that reuses .memory-toolbar: documents, email, cookbook, tasks) was
+   sized for 3 rows and silently overlapped #memory-list with the new one
+   instead of clipping (this toolbar has overflow:visible), since the flex
+   column still only reserved 120px for it. Scoped to this one instance so
+   the shared default is untouched everywhere else. */
+#memory-modal .memory-tab-panel[data-memory-panel="browse"] .memory-toolbar {
+  max-height: 160px;
 }
 .doclib-card {
   background: color-mix(in srgb, var(--fg) 3%, transparent);
