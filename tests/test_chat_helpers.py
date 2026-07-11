@@ -496,7 +496,7 @@ async def _build_context_owner_probe(monkeypatch, request_state):
         captured["prefs_owner"] = owner
         return {"memory_enabled": True, "skills_enabled": True}
 
-    def fake_build_context_preface(**kwargs):
+    async def fake_build_context_preface(**kwargs):
         captured["preface_owner"] = kwargs["owner"]
         return [], [], []
 

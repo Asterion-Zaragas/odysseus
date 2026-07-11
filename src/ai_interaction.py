@@ -521,6 +521,69 @@ async def do_manage_memory(content: str, session_id: Optional[str] = None, owner
         return {"error": f"Unknown action '{action}'. Use: list, add, edit, delete, search"}
 
 
+async def do_retrieve_memory_context(content: str, owner: Optional[str] = None) -> Dict:
+    """Ad-hoc staged memory retrieval (memory upgrade Phase 6): lets the agent
+    re-query the memory store mid-task at a chosen effort depth, independent
+    of whatever the chat preface already auto-injected this turn. Read-only.
+
+    Content format:
+      Line 1: query
+      Line 2 (optional): effort (low|medium|high, default medium)
+    Also accepts a JSON object ``{"query": "...", "effort": "..."}`` (the
+    shape native function calls arrive in via tool_schemas.py).
+    """
+    if not _memory_manager:
+        return {"error": "Memory manager not available"}
+
+    query = ""
+    effort = "medium"
+    parsed_json = None
+    try:
+        parsed_json = json.loads(content)
+    except (json.JSONDecodeError, TypeError):
+        pass
+    if isinstance(parsed_json, dict):
+        query = str(parsed_json.get("query") or "").strip()
+        effort = str(parsed_json.get("effort") or "medium").strip()
+    else:
+        lines = content.strip().split("\n")
+        query = lines[0].strip() if lines else ""
+        if len(lines) > 1 and lines[1].strip():
+            effort = lines[1].strip()
+
+    if not query:
+        return {"error": "retrieve_memory_context needs a query (line 1)"}
+
+    from services.memory.retrieval import retrieve
+
+    entries = _memory_manager.load(owner=owner)
+    # interactive=True: this tool call runs inline inside the agent's own
+    # tracked HTTP request — see tag_memory's identical reasoning in
+    # services/memory/memory_tagger.py. Waiting on interactive_gate's
+    # foreground-quiet check here would deadlock the request against itself.
+    result = await retrieve(
+        query, entries, effort=effort, memory_vector=_memory_vector,
+        owner=owner, k=5, interactive=True,
+    )
+    memories = result["memories"]
+    effort_used = result["effort_used"]
+
+    if not memories:
+        return {"results": f"No relevant memories found for '{query}' (effort={effort_used})."}
+
+    if _memory_manager and hasattr(_memory_manager, "increment_uses"):
+        try:
+            _memory_manager.increment_uses([m["id"] for m in memories if m.get("id")])
+        except Exception as _e:
+            logger.warning("Failed to increment memory uses: %s", _e)
+
+    result_lines = [f"Found {len(memories)} relevant memories (effort={effort_used}):\n"]
+    for m in memories:
+        tags = ",".join(m.get("tags") or []) or "untagged"
+        result_lines.append(f"- [{tags}] {m.get('text', '')}")
+    return {"results": "\n".join(result_lines)}
+
+
 # ---------------------------------------------------------------------------
 # RAG management tool
 # ---------------------------------------------------------------------------
@@ -1460,6 +1523,11 @@ async def dispatch_ai_tool(
         action = content.split("\n")[0].strip()[:40]
         desc = f"manage_memory: {action}"
         result = await do_manage_memory(content, session_id, owner=owner)
+
+    elif tool == "retrieve_memory_context":
+        query_preview = content.split("\n")[0].strip()[:60]
+        desc = f"retrieve_memory_context: {query_preview}"
+        result = await do_retrieve_memory_context(content, owner=owner)
 
     elif tool == "ui_control":
         action = content.split("\n")[0].strip()[:60]

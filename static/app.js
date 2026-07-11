@@ -2036,6 +2036,32 @@ function initializeEventListeners() {
     _syncRagIndicator(ragState);
   }
 
+  // ── Memory context-doc toggle + retrieval effort (memory upgrade Phase 6) ──
+  // Per-turn overrides sent with each chat send (see chat.js); persisted the
+  // same way as the other chat toggles (localStorage, not a server round-trip)
+  // — falls back to the server-side settings default when never touched.
+  const MEMORY_EFFORT_LEVELS = ['low', 'medium', 'high'];
+  function _syncMemoryDocIndicator(active) {
+    const overflow = el('overflow-memory-doc-btn');
+    const chk = el('memory-context-toggle');
+    if (chk) chk.checked = active;
+    if (overflow) overflow.classList.toggle('active', active);
+    const s = loadToggleState(); s.memoryContextDoc = active; saveToggleState(s);
+    updatePlusDot();
+  }
+  function _syncMemoryEffortLabel(effort) {
+    const label = el('overflow-memory-effort-label');
+    if (label) label.textContent = effort.charAt(0).toUpperCase() + effort.slice(1);
+    const s = loadToggleState(); s.memoryEffort = effort; saveToggleState(s);
+  }
+  window._syncMemoryDocIndicator = _syncMemoryDocIndicator;
+  window._syncMemoryEffortLabel = _syncMemoryEffortLabel;
+  {
+    const st = loadToggleState();
+    _syncMemoryDocIndicator(st.memoryContextDoc || false);
+    _syncMemoryEffortLabel(MEMORY_EFFORT_LEVELS.includes(st.memoryEffort) ? st.memoryEffort : 'medium');
+  }
+
   // ── Overflow "..." menu (Research) ──
   function updatePlusDot() {
     const plusBtn = el('overflow-plus-btn');
@@ -2478,6 +2504,25 @@ function initializeEventListeners() {
   if (ragIndicatorBtn) {
     ragIndicatorBtn.addEventListener('click', () => {
       _syncRagIndicator(false);
+    });
+  }
+
+  // ── Overflow memory context-doc toggle + effort cycle ──
+  const overflowMemoryDocBtn = el('overflow-memory-doc-btn');
+  if (overflowMemoryDocBtn) {
+    overflowMemoryDocBtn.addEventListener('click', () => {
+      const chk = el('memory-context-toggle');
+      const isActive = chk ? !chk.checked : true;
+      _syncMemoryDocIndicator(isActive);
+    });
+  }
+  const overflowMemoryEffortBtn = el('overflow-memory-effort-btn');
+  if (overflowMemoryEffortBtn) {
+    overflowMemoryEffortBtn.addEventListener('click', () => {
+      const st = loadToggleState();
+      const current = MEMORY_EFFORT_LEVELS.includes(st.memoryEffort) ? st.memoryEffort : 'medium';
+      const next = MEMORY_EFFORT_LEVELS[(MEMORY_EFFORT_LEVELS.indexOf(current) + 1) % MEMORY_EFFORT_LEVELS.length];
+      _syncMemoryEffortLabel(next);
     });
   }
 

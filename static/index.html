@@ -1021,6 +1021,7 @@
     <input type="checkbox" id="research-toggle" style="display:none;">
     <input type="checkbox" id="rag-toggle" style="display:none;">
     <input type="checkbox" id="incognito-toggle" style="display:none;">
+    <input type="checkbox" id="memory-context-toggle" style="display:none;">
     <input type="file" id="file-input" class="hidden" multiple />
 
     <!-- Unified chat input bar -->
@@ -1105,6 +1106,17 @@
                 </svg>
                 <span>RAG</span>
                 <span class="overflow-active-dot"></span>
+              </button>
+              <!-- Memory context document injection toggle (memory upgrade Phase 6) -->
+              <button type="button" class="overflow-menu-item" id="overflow-memory-doc-btn" title="Inject the memory context document (core facts + tag registry) instead of individual core memories">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M9.5 2a2.5 2.5 0 0 0-2.5 2.5 2.5 2.5 0 0 0-2.5 2.5A2.5 2.5 0 0 0 2 9.5v3A2.5 2.5 0 0 0 4.5 15a2.5 2.5 0 0 0 2.5 2.5A2.5 2.5 0 0 0 9.5 20H10V2z"/><path d="M14.5 2a2.5 2.5 0 0 1 2.5 2.5 2.5 2.5 0 0 1 2.5 2.5A2.5 2.5 0 0 1 22 9.5v3A2.5 2.5 0 0 1 19.5 15a2.5 2.5 0 0 1-2.5 2.5A2.5 2.5 0 0 1 14.5 20H14V2z"/></svg>
+                <span>Memory doc</span>
+                <span class="overflow-active-dot"></span>
+              </button>
+              <!-- Memory retrieval effort — cycles low/medium/high on click -->
+              <button type="button" class="overflow-menu-item" id="overflow-memory-effort-btn" title="How deep chat searches saved memory each turn (higher = slower, more thorough)">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20V10"/><path d="M18 20V4"/><path d="M6 20v-4"/></svg>
+                <span>Memory effort: <span id="overflow-memory-effort-label">Medium</span></span>
               </button>
               <button type="button" class="overflow-menu-item" id="overflow-workspace-btn">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">

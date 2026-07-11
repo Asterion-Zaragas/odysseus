@@ -26,6 +26,7 @@ _REQUIRED_NATIVE_TOOL_ARGS = {
     "write_file": ("path",),
     "edit_file": ("path",),
     "apply_patch": ("patch_text", "patchText", "patch"),
+    "retrieve_memory_context": ("query",),
 }
 
 # ---------------------------------------------------------------------------
@@ -450,6 +451,22 @@ FUNCTION_TOOL_SCHEMAS = [
                                  "description": "Deprecated alias for a single tag (for add/list filter); prefer 'tags'."}
                 },
                 "required": ["action"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "retrieve_memory_context",
+            "description": "Re-search the user's saved memories mid-task at a chosen effort depth, independent of whatever memory context was already auto-injected this turn. Read-only — use manage_memory to save new facts.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "What to look up in memory"},
+                    "effort": {"type": "string", "enum": ["low", "medium", "high"],
+                               "description": "Search depth: low = no LLM calls, tiers 0-1 only; medium (default) = tag-filtered search over tiers 0-2; high = full store incl. archive, LLM-verified top picks. Higher effort costs more latency."}
+                },
+                "required": ["query"]
             }
         }
     },
@@ -1518,7 +1535,10 @@ def function_call_to_tool_block(name: str, arguments: str) -> Optional[ToolBlock
             if not text and args.get("key"):
                 text = str(args.get("key") or "")
             content = "add\n" + str(text)
-            if args.get("category"):
+            tags = args.get("tags")
+            if isinstance(tags, list) and tags:
+                content += "\n" + ",".join(str(t) for t in tags if str(t).strip())
+            elif args.get("category"):
                 content += "\n" + args["category"]
             elif args.get("key"):
                 content += "\n" + str(args["key"])
@@ -1534,6 +1554,8 @@ def function_call_to_tool_block(name: str, arguments: str) -> Optional[ToolBlock
                 content += "\n" + args["category"]
         else:
             content = action
+    elif tool_type == "retrieve_memory_context":
+        content = json.dumps({"query": args.get("query", ""), "effort": args.get("effort") or "medium"})
     elif tool_type == "list_models":
         content = args.get("filter", "")
     elif tool_type == "ui_control":

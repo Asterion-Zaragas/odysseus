@@ -1707,6 +1707,13 @@ import { wireArrowUpRecall, getUserMessagesFromChatHistory } from './composerArr
       if (isIncognito) {
         fd.append('incognito', 'true');
       }
+      // Memory retrieval controls (memory upgrade Phase 6): per-turn effort
+      // level + optional context-document injection, mirroring the RAG
+      // toggle's persistence via Storage toggle state.
+      fd.append('memory_effort', toggleState.memoryEffort || 'medium');
+      if (toggleState.memoryContextDoc) {
+        fd.append('use_memory_context_doc', 'true');
+      }
       const _ws = (Storage.KEYS && Storage.get(Storage.KEYS.WORKSPACE, '')) || '';
       if (_ws) {
         fd.append('workspace', _ws);

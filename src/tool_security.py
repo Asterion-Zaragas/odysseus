@@ -53,6 +53,7 @@ NON_ADMIN_BLOCKED_TOOLS = BUILTIN_EMAIL_TOOLS | {
     "get_workspace",
     "search_chats",
     "manage_memory",
+    "retrieve_memory_context",
     "manage_skills",
     "manage_tasks",
     "manage_endpoints",
@@ -123,6 +124,7 @@ PLAN_MODE_READONLY_TOOLS = {
     "resolve_contact",
     "chat_with_model",
     "ask_teacher",
+    "retrieve_memory_context",
 }
 
 

@@ -131,7 +131,7 @@ def _patch_flow(monkeypatch, llm_behaviour, captured):
     monkeypatch.setattr("src.llm_core.llm_call", _fake_llm)
 
 
-def test_generated_query_is_used_and_sanitized(monkeypatch):
+async def test_generated_query_is_used_and_sanitized(monkeypatch):
     """Requirement: on LLM success the generated query wins, and the *final*
     query handed to comprehensive_web_search() is sanitized.
 
@@ -141,7 +141,7 @@ def test_generated_query_is_used_and_sanitized(monkeypatch):
     _patch_flow(monkeypatch, "capital of `France`", captured)
 
     processor = ChatProcessor(memory_manager=_Memory(), personal_docs_manager=_Docs())
-    preface, _, _ = processor.build_context_preface(
+    preface, _, _ = await processor.build_context_preface(
         message=_MESSY,
         session=_Session(),
         use_web=True,
@@ -164,14 +164,14 @@ def test_generated_query_is_used_and_sanitized(monkeypatch):
     assert any("web context" in (msg.get("content") or "") for msg in preface)
 
 
-def test_falls_back_to_sanitized_first_line_when_llm_raises(monkeypatch):
+async def test_falls_back_to_sanitized_first_line_when_llm_raises(monkeypatch):
     """Requirement: when the LLM call raises, #4557's fallback (first non-empty
     line) is used — and that fallback is sanitized before the search call."""
     captured = {}
     _patch_flow(monkeypatch, RuntimeError("LLM endpoint down"), captured)
 
     processor = ChatProcessor(memory_manager=_Memory(), personal_docs_manager=_Docs())
-    processor.build_context_preface(
+    await processor.build_context_preface(
         message=_MESSY,
         session=_Session(),
         use_web=True,
@@ -188,14 +188,14 @@ def test_falls_back_to_sanitized_first_line_when_llm_raises(monkeypatch):
     assert "leaked body" not in captured["query"]
 
 
-def test_falls_back_to_sanitized_first_line_when_llm_returns_empty(monkeypatch):
+async def test_falls_back_to_sanitized_first_line_when_llm_returns_empty(monkeypatch):
     """Requirement: when the LLM returns an empty/whitespace-only query, #4557
     falls back — and that fallback is sanitized before the search call."""
     captured = {}
     _patch_flow(monkeypatch, "   ", captured)
 
     processor = ChatProcessor(memory_manager=_Memory(), personal_docs_manager=_Docs())
-    processor.build_context_preface(
+    await processor.build_context_preface(
         message=_MESSY,
         session=_Session(),
         use_web=True,

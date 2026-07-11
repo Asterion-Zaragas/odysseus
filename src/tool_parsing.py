@@ -277,6 +277,8 @@ _TOOL_NAME_MAP = {
     "session_control": "manage_session",
     "manage_memory": "manage_memory",
     "memory": "manage_memory",
+    "retrieve_memory_context": "retrieve_memory_context",
+    "recall_memory": "retrieve_memory_context",
     "manage_tasks": "manage_tasks",
     "tasks": "manage_tasks",
     "schedule": "manage_tasks",

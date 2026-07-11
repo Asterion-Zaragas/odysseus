@@ -729,6 +729,14 @@ def setup_chat_routes(
         allow_bash = form_data.get("allow_bash") or (body or {}).get("allow_bash")
         allow_web_search = form_data.get("allow_web_search") or (body or {}).get("allow_web_search")
         use_rag = form_data.get("use_rag")
+        memory_effort = form_data.get("memory_effort") or (body or {}).get("memory_effort")
+        _use_memory_context_doc_raw = form_data.get("use_memory_context_doc")
+        if _use_memory_context_doc_raw is None:
+            _use_memory_context_doc_raw = (body or {}).get("use_memory_context_doc")
+        use_memory_context_doc = (
+            str(_use_memory_context_doc_raw).lower() == "true"
+            if _use_memory_context_doc_raw is not None else None
+        )
         search_context = form_data.get("search_context")  # pre-fetched web search results (compare mode)
         compare_mode = str(form_data.get("compare_mode", "")).lower() == "true"
         incognito = str(form_data.get("incognito", "")).lower() == "true"
@@ -992,6 +1000,8 @@ def setup_chat_routes(
             # index would be useless / unwanted noise.
             agent_mode=(chat_mode == "agent"),
             allow_tool_preprocessing=allow_tool_preprocessing,
+            memory_effort=memory_effort,
+            use_memory_context_doc=use_memory_context_doc,
         )
 
         _research_flags = {"do": do_research}  # Mutable container for generator scope
@@ -1103,7 +1113,7 @@ def setup_chat_routes(
             # when the request's explicit web setting enabled them.
             disabled_tools.update({
                 "bash", "python",
-                "search_chats", "manage_skills", "manage_memory",
+                "search_chats", "manage_skills", "manage_memory", "retrieve_memory_context",
                 "read_file", "write_file", "edit_file",
                 "create_document", "edit_document", "update_document",
                 "send_email", "reply_to_email",
@@ -1122,6 +1132,7 @@ def setup_chat_routes(
         if incognito:
             disabled_tools.update({
                 "manage_memory",      # persistent memory store
+                "retrieve_memory_context",  # staged memory retrieval (same store)
                 "search_chats",       # past chat history
                 "manage_skills",      # skill presets tied to user
                 "create_session",
@@ -1161,7 +1172,7 @@ def setup_chat_routes(
             if not _privs.get("can_generate_images", True):
                 disabled_tools.add("generate_image")
             if not _privs.get("can_manage_memory", True):
-                disabled_tools.update({"manage_memory", "manage_skills"})
+                disabled_tools.update({"manage_memory", "manage_skills", "retrieve_memory_context"})
             if not _privs.get("can_use_research", True):
                 _research_flags["do"] = False
             if not _privs.get("can_use_agent", True):
@@ -1195,7 +1206,7 @@ def setup_chat_routes(
                 "create_document", "edit_document", "update_document",
                 "chat_with_model", "create_session", "list_sessions",
                 "send_to_session",
-                "pipeline", "manage_session", "manage_memory", "list_models",
+                "pipeline", "manage_session", "manage_memory", "retrieve_memory_context", "list_models",
                 "generate_image", "ui_control",
             }
             disabled_tools.update(_compare_strip)

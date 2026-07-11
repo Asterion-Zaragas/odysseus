@@ -2,7 +2,7 @@ from unittest.mock import MagicMock
 from types import SimpleNamespace
 from src.chat_processor import ChatProcessor
 
-def test_build_context_preface_web_search_success(monkeypatch):
+async def test_build_context_preface_web_search_success(monkeypatch):
     """Test that LLM correctly extracts and uses a web search query."""
     mock_llm_call = MagicMock(return_value="extracted query")
     monkeypatch.setattr("src.llm_core.llm_call", mock_llm_call)
@@ -13,7 +13,7 @@ def test_build_context_preface_web_search_success(monkeypatch):
     processor = ChatProcessor(memory_manager=MagicMock(), personal_docs_manager=MagicMock())
     session = SimpleNamespace(endpoint_url="http://local", model="test", headers={})
 
-    processor.build_context_preface(
+    await processor.build_context_preface(
         message="Some text.\n\nSearch for LLMs.",
         session=session,
         use_web=True,
@@ -24,7 +24,7 @@ def test_build_context_preface_web_search_success(monkeypatch):
 
     mock_web_search.assert_called_with("extracted query", time_filter=None, return_sources=True)
 
-def test_build_context_preface_web_search_fallback_on_llm_failure(monkeypatch):
+async def test_build_context_preface_web_search_fallback_on_llm_failure(monkeypatch):
     """Test fallback to original query if LLM fails."""
     def failing_llm(*args, **kwargs):
         raise ValueError("LLM down")
@@ -36,7 +36,7 @@ def test_build_context_preface_web_search_fallback_on_llm_failure(monkeypatch):
     processor = ChatProcessor(memory_manager=MagicMock(), personal_docs_manager=MagicMock())
     session = SimpleNamespace(endpoint_url="http://local", model="test", headers={})
 
-    processor.build_context_preface(
+    await processor.build_context_preface(
         message="First line\nSecond line",
         session=session,
         use_web=True,
@@ -47,7 +47,7 @@ def test_build_context_preface_web_search_fallback_on_llm_failure(monkeypatch):
 
     mock_web_search.assert_called_with("First line", time_filter=None, return_sources=True)
 
-def test_build_context_preface_web_search_fallback_on_empty_generation(monkeypatch):
+async def test_build_context_preface_web_search_fallback_on_empty_generation(monkeypatch):
     """Test fallback to original query if LLM returns empty string."""
     mock_llm_call = MagicMock(return_value="   \n  ")
     monkeypatch.setattr("src.llm_core.llm_call", mock_llm_call)
@@ -58,7 +58,7 @@ def test_build_context_preface_web_search_fallback_on_empty_generation(monkeypat
     processor = ChatProcessor(memory_manager=MagicMock(), personal_docs_manager=MagicMock())
     session = SimpleNamespace(endpoint_url="http://local", model="test", headers={})
 
-    processor.build_context_preface(
+    await processor.build_context_preface(
         message="\n\nFallback line\nNext",
         session=session,
         use_web=True,
@@ -69,7 +69,7 @@ def test_build_context_preface_web_search_fallback_on_empty_generation(monkeypat
 
     mock_web_search.assert_called_with("Fallback line", time_filter=None, return_sources=True)
 
-def test_build_context_preface_web_search_query_sanitization(monkeypatch):
+async def test_build_context_preface_web_search_query_sanitization(monkeypatch):
     """Test that query is truncated and whitespace collapsed."""
     long_query = "word  " * 50
     mock_llm_call = MagicMock(return_value=long_query)
@@ -81,7 +81,7 @@ def test_build_context_preface_web_search_query_sanitization(monkeypatch):
     processor = ChatProcessor(memory_manager=MagicMock(), personal_docs_manager=MagicMock())
     session = SimpleNamespace(endpoint_url="http://local", model="test", headers={})
 
-    processor.build_context_preface(
+    await processor.build_context_preface(
         message="Message",
         session=session,
         use_web=True,

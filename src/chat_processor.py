@@ -1,14 +1,13 @@
 # src/chat_processor.py
 import logging
-import math
 import re
-import time
-from collections import Counter
 from typing import List, Dict, Any, Optional, Tuple
 from src.chat_helpers import extract_urls
 from src.youtube_handler import is_youtube_url
 from src.search import comprehensive_web_search, fetch_webpage_content
 from src.prompt_security import UNTRUSTED_CONTEXT_POLICY, untrusted_context_message
+from services.memory.retrieval import retrieve as memory_retrieve
+from services.memory.tier_scoring import TIER_CORE
 
 logger = logging.getLogger(__name__)
 
@@ -49,35 +48,6 @@ def _clean_search_query(query: str, max_len: int = 200) -> str:
     text = soup.get_text(" ", strip=True)
     text = re.sub(r"\s+", " ", text)
     return text[:max_len]
-
-
-# ── Stopwords & tokenizer ──
-
-_STOPWORDS = frozenset(
-    "a an the is am are was were be been being have has had do does did "
-    "will would shall should can could may might must need ought dare "
-    "i me my mine we us our ours you your yours he him his she her hers "
-    "it its they them their theirs this that these those "
-    "and but or nor not no so if then else than too also very "
-    "in on at to for of by with from up out about into over after "
-    "what when where which who whom how why all each every some any "
-    "just very really actually like well also still already even "
-    "oh ok okay yes yeah hey hi hello thanks thank please sorry "
-    "much more most own other another such only same here there "
-    "because while during before until since through between both "
-    "few many several some none nothing something anything everything "
-    "get got make made go going went been come came take took "
-    "know think want let say tell give see look find way thing "
-    "don doesn didn won wouldn couldn shouldn wasn weren isn aren haven hasn "
-    "don't doesn't didn't won't wouldn't couldn't shouldn't "
-    "it's i'm i've i'll i'd you're you've you'll he's she's we're we've they're they've "
-    "that's there's here's what's who's how's let's can't".split()
-)
-
-def _content_tokens(text: str) -> list:
-    """Extract meaningful content words: no stopwords, min 3 chars, lowercase."""
-    words = re.findall(r'[a-z0-9]+(?:[-_][a-z0-9]+)*', text.lower())
-    return [w for w in words if len(w) >= 3 and w not in _STOPWORDS]
 
 
 class ChatProcessor:
@@ -155,112 +125,7 @@ class ChatProcessor:
             selected.append(memory)
         return selected[:self.PINNED_MEMORY_LIMIT]
 
-    def _hybrid_retrieve(self, message: str, mem_entries: list, k: int = 5) -> list:
-        """Retrieve memories relevant to the message.
-
-        Uses BM25-style keyword scoring + optional vector similarity.
-        Recency is a tiebreaker only, never the primary signal.
-        """
-        if not mem_entries or not message.strip():
-            return []
-
-        now = time.time()
-        query_tokens = _content_tokens(message)
-
-        # If the query has no meaningful tokens, skip keyword retrieval entirely
-        if not query_tokens:
-            # Fall back to vector-only if available
-            if not (self.memory_vector and self.memory_vector.healthy):
-                return []
-
-        # ── Build IDF from the memory corpus ──
-        N = len(mem_entries)
-        doc_freq = Counter()  # token -> how many memories contain it
-        mem_token_cache = {}  # mem_id -> set of content tokens
-        for mem in mem_entries:
-            toks = set(_content_tokens(mem["text"]))
-            mem_token_cache[mem["id"]] = toks
-            for t in toks:
-                doc_freq[t] += 1
-
-        def _bm25_score(query_toks, mem_id):
-            """BM25-inspired score between query and a memory."""
-            mem_toks = mem_token_cache.get(mem_id, set())
-            if not mem_toks or not query_toks:
-                return 0.0
-            score = 0.0
-            mem_len = len(mem_toks)
-            avg_len = max(sum(len(v) for v in mem_token_cache.values()) / N, 1)
-            k1, b = 1.5, 0.75
-            for qt in query_toks:
-                if qt not in mem_toks:
-                    continue
-                df = doc_freq.get(qt, 0)
-                idf = math.log((N - df + 0.5) / (df + 0.5) + 1)
-                tf = 1  # binary presence (memory entries are short)
-                tf_norm = (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * mem_len / avg_len))
-                score += idf * tf_norm
-            return score
-
-        # ── Score all candidates ──
-        has_vector = self.memory_vector and self.memory_vector.healthy
-        vector_scores = {}
-
-        if has_vector:
-            results = self.memory_vector.search(message, k=min(k * 3, 20))
-            mem_by_id = {m["id"]: m for m in mem_entries}
-            for r in results:
-                if r["memory_id"] in mem_by_id:
-                    vector_scores[r["memory_id"]] = max(r["score"], 0.0)
-
-        scored = []
-        for mem in mem_entries:
-            mid = mem["id"]
-            vs = vector_scores.get(mid, 0.0)
-            kw = _bm25_score(query_tokens, mid)
-
-            # Normalize BM25 to roughly 0-1 range (cap at a reasonable max)
-            kw_norm = min(kw / 6.0, 1.0) if kw > 0 else 0.0
-
-            # Tag-aware boost for identity/contact queries
-            tags = mem.get("tags") or []
-            msg_lower = message.lower()
-            mem_lower = mem["text"].lower()
-            tag_boost = 1.0
-            if any(w in msg_lower for w in ["name", "who am i", "my name"]):
-                if "identity" in tags or any(w in mem_lower for w in ["name is", "i am", "called"]):
-                    tag_boost = 1.4
-            elif any(w in msg_lower for w in ["phone", "email", "address", "contact"]):
-                if "contact" in tags or "@" in mem_lower:
-                    tag_boost = 1.3
-            elif any(w in msg_lower for w in ["like", "prefer", "favorite"]):
-                if "preference" in tags:
-                    tag_boost = 1.2
-
-            kw_norm = min(kw_norm * tag_boost, 1.0)
-
-            # Recency — tiebreaker only (max 5% contribution)
-            ts = mem.get("timestamp", 0)
-            days_old = max((now - ts) / 86400, 0)
-            recency = 1.0 / (1.0 + days_old * 0.05)
-
-            # Gate: need real relevance, not just recency
-            if has_vector:
-                if vs < 0.20 and kw_norm < 0.08:
-                    continue
-                final = (0.55 * vs) + (0.40 * kw_norm) + (0.05 * recency)
-            else:
-                if kw_norm < 0.08:
-                    continue
-                final = (0.95 * kw_norm) + (0.05 * recency)
-
-            if final > 0.12:
-                scored.append((final, mem))
-
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return [mem for _, mem in scored[:k]]
-
-    def build_context_preface(
+    async def build_context_preface(
         self,
         message: str,
         session: Any,
@@ -274,6 +139,8 @@ class ChatProcessor:
         agent_mode: bool = False,
         incognito: bool = False,
         use_skills: bool = True,
+        memory_effort: Optional[str] = None,
+        use_memory_context_doc: Optional[bool] = None,
     ) -> Tuple[List[Dict[str, str]], List[Dict[str, Any]], List[Dict[str, str]]]:
         """Build the context preface for LLM calls.
 
@@ -307,33 +174,66 @@ class ChatProcessor:
             "content": UNTRUSTED_CONTEXT_POLICY,
         })
 
-        # Memory: core pinned facts + relevant pinned/extended recall.
+        # Memory: core (pinned + tier-0, always included — optionally replaced
+        # by the context-doc render) + rest (staged retrieval when relevant).
         self._last_used_memories = []  # track what was injected
         if use_memory:
-            mem_entries = self.memory_manager.load(owner=owner)
+            from src.settings import get_setting
 
-            pinned = [m for m in mem_entries if m.get("pinned")]
-            extended = [m for m in mem_entries if not m.get("pinned")]
+            if use_memory_context_doc is None:
+                use_memory_context_doc = bool(get_setting("memory_context_doc_injection", False))
+            if not memory_effort:
+                memory_effort = get_setting("memory_retrieval_effort", "medium")
+
+            mem_entries = self.memory_manager.load(owner=owner)
+            core = [
+                m for m in mem_entries
+                if m.get("pinned") or int(m.get("tier") if m.get("tier") is not None else 2) == TIER_CORE
+            ]
+            core_ids = {m.get("id") for m in core}
+            rest = [m for m in mem_entries if m.get("id") not in core_ids]
 
             _used_ids: list = []
-            selected_pinned = self._select_pinned_memories(message, pinned)
-            if selected_pinned:
-                pinned_text = "\n- ".join([m["text"] for m in selected_pinned])
+            if use_memory_context_doc:
+                from services.memory.memory_context import MemoryContext
+
+                doc_text = MemoryContext(owner).render_markdown()
+                preface.append(untrusted_context_message("saved memory: context document", doc_text))
+                # Pinned entries are always injected individually regardless of
+                # the toggle; non-pinned tier-0 entries are covered by the doc's
+                # core-facts section above, so they're suppressed here to avoid
+                # duplication.
+                pinned_only = [m for m in core if m.get("pinned")]
+                if pinned_only:
+                    pinned_text = "\n- ".join([m["text"] for m in pinned_only])
+                    preface.append(untrusted_context_message(
+                        "saved memory: pinned user facts",
+                        f"Core facts about the user:\n- {pinned_text}",
+                    ))
+                    for m in pinned_only:
+                        self._last_used_memories.append({"text": m["text"], "tags": m.get("tags") or [], "type": "pinned"})
+                        if m.get("id"):
+                            _used_ids.append(m["id"])
+            elif core:
+                core_text = "\n- ".join([m["text"] for m in core])
                 preface.append(untrusted_context_message(
-                    "saved memory: pinned context",
-                    (
-                        "Pinned memory context. Some pinned memories are only "
-                        f"included when relevant:\n- {pinned_text}"
-                    ),
+                    "saved memory: pinned user facts",
+                    f"Core facts about the user:\n- {core_text}",
                 ))
-                for m in selected_pinned:
-                    self._last_used_memories.append({"text": m["text"], "category": m.get("category", "fact"), "type": "pinned"})
+                for m in core:
+                    self._last_used_memories.append({
+                        "text": m["text"], "tags": m.get("tags") or [],
+                        "type": "pinned" if m.get("pinned") else "core",
+                    })
                     if m.get("id"):
                         _used_ids.append(m["id"])
 
-            remaining_memory_slots = max(self.MEMORY_CONTEXT_LIMIT - len(self._last_used_memories), 0)
-            if extended and remaining_memory_slots:
-                relevant = self._hybrid_retrieve(message, extended, k=remaining_memory_slots)
+            if rest:
+                result = await memory_retrieve(
+                    message, rest, effort=memory_effort, memory_vector=self.memory_vector,
+                    owner=owner, k=3, interactive=True,
+                )
+                relevant = result["memories"]
                 if relevant:
                     ext_text = "\n".join([f"- {m['text']}" for m in relevant])
                     preface.append(untrusted_context_message(

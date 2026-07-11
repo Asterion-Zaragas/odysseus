@@ -687,6 +687,8 @@ async def build_chat_context(
     use_enhanced_message: bool = False,
     agent_mode: bool = False,
     allow_tool_preprocessing: bool = True,
+    memory_effort: Optional[str] = None,
+    use_memory_context_doc: Optional[bool] = None,
 ) -> ChatContext:
     """Build the full context (preface + messages) for an LLM call.
 
@@ -779,10 +781,12 @@ async def build_chat_context(
         agent_mode=agent_mode,
         incognito=incognito,
         use_skills=skills_enabled,
+        memory_effort=memory_effort,
+        use_memory_context_doc=use_memory_context_doc,
     )
     if use_rag is not None or is_research_spinoff or casual_low_signal:
         _preface_kwargs["use_rag"] = use_rag_val
-    preface, rag_sources, web_sources = chat_processor.build_context_preface(**_preface_kwargs)
+    preface, rag_sources, web_sources = await chat_processor.build_context_preface(**_preface_kwargs)
 
     # Capture used memories immediately
     used_memories = getattr(chat_processor, '_last_used_memories', [])
