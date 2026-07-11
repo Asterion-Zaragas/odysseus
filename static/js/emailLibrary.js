@@ -1904,7 +1904,7 @@ function _resetBulkSelectionForContextChange({ rerender = false } = {}) {
   }
 }
 
-function _resetEmailListForFreshLoad({ useCache = true } = {}) {
+function _resetEmailListForFreshLoad() {
   _exitEmailReaderModeForList();
   _resetBulkSelectionForContextChange();
   state._libOffset = 0;
