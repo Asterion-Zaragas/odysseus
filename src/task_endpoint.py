@@ -86,12 +86,17 @@ async def task_llm_call_async(
 MEMORY_ROLES = ("fast", "smart")
 
 
-def resolve_memory_candidates(role, owner=None):
+def resolve_memory_candidates(role, owner=None, fallback_url=None, fallback_model=None, fallback_headers=None):
     """Return ordered LLM candidates for a memory-system agent role.
 
     Order:
     1. configured `memory_{role}_endpoint_id` / `memory_{role}_model`
     2. the background-task candidate chain (resolve_task_candidates)
+    3. `fallback_url`/`fallback_model` (e.g. a caller's own current chat
+       endpoint), appended last as a final safety net when nothing above
+       resolved — callers that already have a known-working endpoint at hand
+       (the extractor, threaded from the session) pass it here instead of
+       calling the LLM with it directly.
     """
     if role not in MEMORY_ROLES:
         raise ValueError(f"unknown memory role: {role!r}")
@@ -109,6 +114,7 @@ def resolve_memory_candidates(role, owner=None):
     _append(*resolve_endpoint(f"memory_{role}", owner=owner))
     for url, model, headers in resolve_task_candidates(owner=owner):
         _append(url, model, headers)
+    _append(fallback_url, fallback_model, fallback_headers)
 
     return candidates
 
@@ -119,6 +125,9 @@ async def memory_llm_call_async(
     *,
     interactive=False,
     owner=None,
+    fallback_url=None,
+    fallback_model=None,
+    fallback_headers=None,
     **kwargs,
 ):
     """Call the shared candidate chain for a memory-system agent role.
@@ -128,8 +137,14 @@ async def memory_llm_call_async(
     a chat turn, so it must not queue behind the same "UI is busy" window it
     is itself part of. Every other memory role (tagger, curator, distiller)
     runs off the interactive path and keeps the gate.
+
+    `fallback_url`/`fallback_model`/`fallback_headers` are appended as the
+    last candidate — see `resolve_memory_candidates`.
     """
-    candidates = resolve_memory_candidates(role, owner=owner)
+    candidates = resolve_memory_candidates(
+        role, owner=owner,
+        fallback_url=fallback_url, fallback_model=fallback_model, fallback_headers=fallback_headers,
+    )
     if not candidates:
         raise RuntimeError(f"No LLM endpoint available for memory {role} task")
     if not interactive:

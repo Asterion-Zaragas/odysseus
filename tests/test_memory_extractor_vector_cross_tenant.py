@@ -33,19 +33,27 @@ def _load_extractor():
 
 
 def _install_llm_stub(monkeypatch, facts_json):
-    mod = types.ModuleType("src.llm_core")
+    # Since Phase 5, extract_and_store calls the memory-smart role via
+    # src.task_endpoint.memory_llm_call_async instead of the raw LLM
+    # directly, and the store loop's (unmocked) tag_memory() call goes
+    # through the same function on the memory-fast role — stub the whole
+    # module so neither call needs to import the real, heavier
+    # endpoint_resolver/interactive_gate/llm_core chain.
+    mod = types.ModuleType("src.task_endpoint")
 
-    async def llm_call_async(*a, **k):
-        return facts_json
+    async def memory_llm_call_async(role, messages, *, interactive=False, owner=None, **kwargs):
+        if role == "smart":
+            return facts_json
+        return '{"tags": [], "new_tags": [], "generality": null}'
 
-    mod.llm_call_async = llm_call_async
+    mod.memory_llm_call_async = memory_llm_call_async
     # Use monkeypatch.setitem so sys.modules is restored at teardown. A raw
-    # assignment here permanently replaced the real src.llm_core with this
-    # stripped stub, leaking "My home is in Lisbon" (and hiding _detect_provider)
-    # into every later-collected test that imports the real module.
+    # assignment here permanently replaced the real src.task_endpoint with
+    # this stripped stub, leaking into every later-collected test that
+    # imports the real module.
     src_pkg = sys.modules.get("src") or types.ModuleType("src")
     monkeypatch.setitem(sys.modules, "src", src_pkg)
-    monkeypatch.setitem(sys.modules, "src.llm_core", mod)
+    monkeypatch.setitem(sys.modules, "src.task_endpoint", mod)
 
 
 class FakeSession:
@@ -105,7 +113,6 @@ def test_vector_match_from_other_tenant_does_not_drop_users_fact(monkeypatch):
 
     asyncio.run(memory_extractor.extract_and_store(
         FakeSession(owner="userB"), mm, vec,
-        endpoint_url="http://x", model="m",
     ))
 
     b_texts = {r["text"] for r in mm.load(owner="userB")}

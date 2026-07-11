@@ -1,10 +1,12 @@
 """
 memory_extractor.py
 
-Background auto-extraction of facts from chat conversations.
-After each LLM response, this module sends the last few messages to the LLM
-asking it to extract memorable facts, then stores them in both memory.json
-and the FAISS vector index.
+Background auto-extraction of facts from chat conversations (the
+"distiller"). After each LLM response, this module sends the last few
+messages to the *memory-smart* role asking it to extract memorable facts —
+context-aware (told what's already known, so it doesn't re-extract it) and
+scored for durability — then tags (services/memory/memory_tagger.py) and
+stores them in both memory.json and the vector index.
 
 Full deduplication/consolidation, tag normalization, tier rescoring, and
 archive expiry are the nightly curator's job now (services/memory/
@@ -42,28 +44,75 @@ def _memory_dicts(entries):
             yield entry
 
 
-EXTRACT_SYSTEM_PROMPT = (
-    "You are a memory extraction assistant. Analyze the conversation and extract ONLY "
-    "durable personal facts about the user that would be useful across many future conversations.\n\n"
-    "Good examples: name, job title, city, family members, long-term projects, strong preferences.\n"
-    "Bad examples: what they asked about today, temporary moods, generic statements, "
-    "things the assistant said, one-off tasks, opinions on the current topic.\n\n"
+EXTRACT_SYSTEM_PROMPT_TEMPLATE = (
+    "You are a memory-extraction agent for a personal AI assistant. Read the "
+    "conversation and decide which facts, if any, are worth remembering long-term.\n\n"
+    "INCLUDE — durable facts likely to matter in many future conversations:\n"
+    "- stable identity: name, job/role, employer, home city, family members\n"
+    "- long-running projects, goals, or plans\n"
+    "- strong, stated preferences or constraints (likes/dislikes, dietary, "
+    "accessibility needs, tools they use)\n"
+    "- durable relationships (\"my manager is X\", \"my partner is Y\")\n\n"
+    "EXCLUDE — do not extract:\n"
+    "- what the user is asking about right now, or the current task\n"
+    "- transient moods, one-off requests, or small talk\n"
+    "- anything the ASSISTANT said, not the user\n"
+    "- facts already known (see \"Already known\" below) — do not repeat them "
+    "or close paraphrases\n"
+    "- speculation, or facts you are not confident the user actually stated\n\n"
+    "Examples:\n"
+    "  user: \"can you also check the weather for tomorrow\" -> [] "
+    "(transient request, not a durable fact)\n"
+    "  user: \"I'm a backend engineer at Acme, mostly Python\" -> "
+    "[{{\"text\": \"User is a backend engineer at Acme, works mostly in "
+    "Python.\", \"durability\": 0.9, \"context_hint\": \"talking about their "
+    "job\"}}]\n"
+    "  user: \"ugh, today has been rough\" -> [] (transient mood)\n"
+    "  user: \"I really can't stand cilantro\" -> "
+    "[{{\"text\": \"User dislikes cilantro.\", \"durability\": 0.6, "
+    "\"context_hint\": \"discussing food preferences\"}}]\n\n"
+    "Already known about this user — do NOT re-extract these or close "
+    "paraphrases:\n{known_facts}\n\n"
+    "Known topic tags (context only, do not put tags in your output):\n"
+    "{tag_registry}\n\n"
     "Rules:\n"
     "- MAX 2 facts per conversation — only the most important\n"
-    "- Only extract facts the USER stated or clearly implied\n"
-    "- Each fact must be a single short sentence (under 15 words)\n"
-    "- If a fact is similar to something likely already known, skip it\n"
+    "- Only extract facts the USER stated or clearly implied about themselves\n"
+    "- Each fact's \"text\" must be a single short sentence (under 15 words)\n"
+    "- \"durability\": 0.0-1.0, how durable/broadly useful this fact is "
+    "across future conversations (identity-level facts near 1.0, "
+    "situational facts lower)\n"
+    "- \"context_hint\": a short (<10 word) note on what the conversation "
+    "was about, so a downstream tagger can place this fact in context\n"
     "- If nothing durable was revealed, return []\n\n"
-    "Return a JSON array of objects with 'text' and 'category' fields.\n"
-    "Categories: 'identity', 'preference', 'fact', 'contact', 'project', 'goal'\n\n"
-    "Return ONLY valid JSON, no markdown fences."
+    "Return a JSON array of objects with \"text\", \"durability\", and "
+    "\"context_hint\" fields. Return ONLY valid JSON, no markdown fences."
 )
+
+# Candidates below this durability score are dropped before storage (LLM
+# extractions only — _fallback_memory_candidates' regex hits are already
+# narrow/high-confidence and carry no durability score, so they bypass this).
+DURABILITY_THRESHOLD = 0.6
 
 # How many recent messages to include for extraction
 CONTEXT_WINDOW = 6
 
 AUDIT_INTERVAL = 5  # run the cheap triage pass every N new memories added
 _extractions_since_audit = 0
+
+
+def _build_extract_system_prompt(owner: Optional[str]) -> str:
+    """Render the extraction prompt with this owner's known facts/tags, so
+    the model can skip what it already knows instead of re-extracting it."""
+    from services.memory.memory_context import MemoryContext
+    from src.settings import get_setting
+
+    ctx = MemoryContext(owner)
+    cap = get_setting("memory_tag_registry_cap", 50)
+    return EXTRACT_SYSTEM_PROMPT_TEMPLATE.format(
+        known_facts=ctx.core_facts_excerpt(),
+        tag_registry=ctx.registry_excerpt(max_tags=cap),
+    )
 
 
 def _message_text(message) -> str:
@@ -230,22 +279,25 @@ async def extract_and_store(
     session,
     memory_manager,
     memory_vector,
-    endpoint_url: str,
-    model: str,
-    headers: Optional[dict] = None,
+    fallback_url: Optional[str] = None,
+    fallback_model: Optional[str] = None,
+    fallback_headers: Optional[dict] = None,
 ):
     """Extract facts from recent conversation and store them.
+
+    Runs on the *memory-smart* role (services/memory/memory_context.py +
+    src/task_endpoint.py:memory_llm_call_async), falling back through the
+    background-task chain and finally to `fallback_url`/`fallback_model`
+    (the caller's own current chat endpoint) if nothing else is configured.
 
     Designed to run as a background task (asyncio.create_task).
     Errors are logged, never raised.
     """
-    if not endpoint_url or not model:
-        logger.debug("[memory-extract] No model or URL provided, skipping")
-        return
-
     try:
-        from src.llm_core import llm_call_async
+        from src.task_endpoint import memory_llm_call_async
         from services.memory.memory_tagger import tag_memory, apply_tags
+
+        _owner = getattr(session, 'owner', None)
 
         # Get last N messages from session
         messages = session.get_context_messages()
@@ -297,7 +349,7 @@ async def extract_and_store(
 
         transcript = "\n\n".join(_flatten_msg(m) for m in stripped_recent)
         extraction_messages = [
-            {"role": "system", "content": EXTRACT_SYSTEM_PROMPT},
+            {"role": "system", "content": _build_extract_system_prompt(_owner)},
             {"role": "user", "content": (
                 "Conversation to analyze:\n\n" + transcript
                 + "\n\nReturn the JSON array of durable facts now (or [] if none)."
@@ -306,10 +358,10 @@ async def extract_and_store(
 
         facts = []
         try:
-            raw = await llm_call_async(
-                endpoint_url,
-                model,
+            raw = await memory_llm_call_async(
+                "smart",
                 extraction_messages,
+                owner=_owner,
                 temperature=0.1,
                 # A reasoning model spends most of its budget on <think> tokens
                 # BEFORE emitting the JSON, so the old 500 truncated the response
@@ -318,7 +370,9 @@ async def extract_and_store(
                 # output (a short facts list) is small, so an ample ceiling is
                 # enough once thinking has room.
                 max_tokens=4096,
-                headers=headers,
+                fallback_url=fallback_url,
+                fallback_model=fallback_model,
+                fallback_headers=fallback_headers,
             )
 
             # Parse JSON, tolerating reasoning-model noise (<think> blocks, a
@@ -331,6 +385,21 @@ async def extract_and_store(
         if not isinstance(facts, list):
             facts = []
 
+        # Code-side durability threshold: only the LLM path carries a
+        # "durability" score, so this only filters facts-json objects, never
+        # bare strings or _fallback_memory_candidates' regex hits (already
+        # narrow/high-confidence, no score to filter on).
+        kept_facts = []
+        for f in facts:
+            if isinstance(f, dict) and "durability" in f:
+                try:
+                    if float(f["durability"]) < DURABILITY_THRESHOLD:
+                        continue
+                except (TypeError, ValueError):
+                    pass
+            kept_facts.append(f)
+        facts = kept_facts
+
         if fallback_facts:
             facts = list(facts) + fallback_facts
 
@@ -338,22 +407,24 @@ async def extract_and_store(
             logger.info("Auto memory extraction ran: 0 candidates")
             return
 
-        # Get owner from session
-        _owner = getattr(session, 'owner', None)
-
         existing = memory_manager.load_all()
         added = 0
         new_entries = []
 
         for fact in facts:
-            # The extraction prompt still speaks "category" (rework lands with
-            # the distiller upgrade); its value becomes the entry's first tag.
+            # LLM-path facts carry no category/tags — tagging is the
+            # tagger's job (services/memory/memory_tagger.py), fed by
+            # context_hint. _fallback_memory_candidates' regex hits still
+            # carry a legacy "category", folded into tags by add_entry as
+            # before.
+            context_hint = None
             if isinstance(fact, str):
                 fact_text = fact
-                category = "fact"
+                category = None
             elif isinstance(fact, dict):
                 fact_text = fact.get("text", "").strip()
-                category = fact.get("category", "fact")
+                context_hint = fact.get("context_hint") or None
+                category = fact.get("category")
             else:
                 continue
 
@@ -395,12 +466,12 @@ async def extract_and_store(
                 continue
 
             entry = memory_manager.add_entry(fact_text, source="auto", category=category, owner=_owner)
-            tag_result = await tag_memory(fact_text, owner=_owner)
+            tag_result = await tag_memory(fact_text, context_hint=context_hint, owner=_owner)
             apply_tags(entry, tag_result)
-            # Auto-pin identity facts (name, job, location) — core context.
-            # Goes away with the distiller upgrade: generality → tier 0 takes over.
-            if "identity" in entry["tags"]:
-                entry["pinned"] = True
+            # No more identity auto-pin (Phase 5): the tagger assigns
+            # identity-level facts generality=3, which alone lands them in
+            # tier 0/1 via tier_scoring — pinning is now a purely manual
+            # user flag (concept doc resolved decision).
             if hasattr(session, "session_id"):
                 entry["session_id"] = session.session_id
             elif hasattr(session, "name"):

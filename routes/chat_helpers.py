@@ -1232,13 +1232,12 @@ def run_post_response_tasks(
     _should_extract = (_msg_count >= 4) and (_msg_count % 4 == 0)
     if allow_background_extraction and not incognito and not compare_mode and _should_extract and uprefs.get("auto_memory", True):
         from services.memory.memory_extractor import extract_and_store
-        from src.task_endpoint import resolve_task_endpoint
-        t_url, t_model, t_headers = resolve_task_endpoint(
-            sess.endpoint_url, sess.model, sess.headers, owner=owner,
-        )
+        # The extractor resolves its own memory-smart role (memory_llm_call_async);
+        # the session's own current chat endpoint is threaded through only as
+        # the final fallback if nothing else is configured.
         _extraction_jobs.append(("memory", extract_and_store(
             sess, memory_manager, memory_vector,
-            t_url, t_model, t_headers,
+            fallback_url=sess.endpoint_url, fallback_model=sess.model, fallback_headers=sess.headers,
         )))
 
     # Skill extraction from complex agent runs. Only when the user actually

@@ -17,10 +17,18 @@ the facts still land in the JSON store.
 import asyncio
 import tempfile
 
-import src.llm_core
 import src.event_bus
 from src.memory import MemoryManager
 from services.memory.memory_extractor import extract_and_store
+
+
+async def _fake_memory_llm(role, messages, **kwargs):
+    """Handles both extractor (memory-smart) and tagger (memory-fast)
+    calls: the tagger isn't mocked in these tests, so its real call also
+    flows through this same patched entry point."""
+    if role == "smart":
+        return _fake_memory_llm.facts_json
+    return '{"tags": [], "new_tags": [], "generality": null}'
 
 
 class _FakeSession:
@@ -53,15 +61,12 @@ def _run(coro):
 
 
 def test_extraction_persists_facts_when_vector_store_fails_at_runtime(monkeypatch):
-    facts_json = (
-        '[{"text": "Alice lives in Lisbon", "category": "fact"}, '
-        '{"text": "Alice prefers tea over coffee", "category": "preference"}]'
+    _fake_memory_llm.facts_json = (
+        '[{"text": "Alice lives in Lisbon", "durability": 0.8, "context_hint": "home"}, '
+        '{"text": "Alice prefers tea over coffee", "durability": 0.7, "context_hint": "drinks"}]'
     )
 
-    async def _fake_llm(url, model, messages, **kwargs):
-        return facts_json
-
-    monkeypatch.setattr(src.llm_core, "llm_call_async", _fake_llm)
+    monkeypatch.setattr("src.task_endpoint.memory_llm_call_async", _fake_memory_llm)
     # fire_event touches an async event loop / disk — neutralize it.
     monkeypatch.setattr(src.event_bus, "fire_event", lambda *a, **k: None)
 
@@ -72,9 +77,6 @@ def test_extraction_persists_facts_when_vector_store_fails_at_runtime(monkeypatc
             _FakeSession(),
             mgr,
             _BrokenVectorStore(),
-            endpoint_url="http://x",
-            model="m",
-            headers=None,
         ))
 
         stored = mgr.load(owner="alice")
@@ -93,10 +95,9 @@ def test_healthy_vector_store_still_dedups_normally(monkeypatch):
     fact would be a cross-tenant false drop. Here the match is alice's own
     memory, so the dedup must still fire."""
 
-    async def _fake_llm(url, model, messages, **kwargs):
-        return '[{"text": "Alice lives in Lisbon", "category": "fact"}]'
+    _fake_memory_llm.facts_json = '[{"text": "Alice lives in Lisbon", "durability": 0.8, "context_hint": "home"}]'
 
-    monkeypatch.setattr(src.llm_core, "llm_call_async", _fake_llm)
+    monkeypatch.setattr("src.task_endpoint.memory_llm_call_async", _fake_memory_llm)
     monkeypatch.setattr(src.event_bus, "fire_event", lambda *a, **k: None)
 
     with tempfile.TemporaryDirectory() as data_dir:
@@ -118,7 +119,6 @@ def test_healthy_vector_store_still_dedups_normally(monkeypatch):
 
         _run(extract_and_store(
             _FakeSession(), mgr, _DedupVectorStore(),
-            endpoint_url="http://x", model="m", headers=None,
         ))
         # The new fact was deduped against alice's own memory, so only the
         # seeded entry remains (no duplicate added).
