@@ -254,6 +254,48 @@ async def test_retrieve_high_effort_falls_back_to_top5_when_verify_fails(monkeyp
     assert len(result["memories"]) == 5
 
 
+async def test_retrieve_high_effort_caps_fallback_to_callers_k(monkeypatch):
+    async def fake_extract(*a, **kw):
+        return {"keywords": [], "entities": [], "tag_guesses": []}
+
+    async def fake_verify(message, candidates, owner, interactive):
+        return None  # parse/call failure -> fallback path
+
+    monkeypatch.setattr(retrieval, "_extract_facets", fake_extract)
+    monkeypatch.setattr(retrieval, "_verify", fake_verify)
+
+    text = "sven really loves pizza with extra cheese every friday night"
+    entries = [_entry(str(i), text, tier=1) for i in range(6)]
+    entries += [_entry("distractor-1", "completely unrelated hobby notes", tier=1)]
+    entries += [_entry("distractor-2", "another unconnected topic entirely", tier=1)]
+
+    # A k smaller than both the fallback's implicit 5 and verify's own cap
+    # must still be honored - this is the chat preface's real call shape
+    # (k=3), and prior to this fix a high-effort turn always got up to 5
+    # memories regardless of k.
+    result = await retrieval.retrieve(text, entries, effort="high", k=3)
+
+    assert len(result["memories"]) == 3
+
+
+async def test_retrieve_high_effort_caps_verified_results_to_callers_k(monkeypatch):
+    async def fake_extract(*a, **kw):
+        return {"keywords": [], "entities": [], "tag_guesses": []}
+
+    async def fake_verify(message, candidates, owner, interactive):
+        # The LLM found 4 relevant candidates - more than the caller's k=3.
+        return candidates[:4]
+
+    monkeypatch.setattr(retrieval, "_extract_facets", fake_extract)
+    monkeypatch.setattr(retrieval, "_verify", fake_verify)
+
+    text = "sven really loves pizza with extra cheese every friday night"
+    entries = [_entry(str(i), text, tier=1) for i in range(6)]
+    result = await retrieval.retrieve(text, entries, effort="high", k=3)
+
+    assert len(result["memories"]) == 3
+
+
 async def test_retrieve_normalizes_unknown_effort_to_medium(monkeypatch):
     async def fake_extract(*a, **kw):
         return {"keywords": [], "entities": [], "tag_guesses": []}

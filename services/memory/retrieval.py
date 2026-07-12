@@ -20,9 +20,10 @@ Stages:
      facet keywords folded into the query tokens.
   C. verify (effort high only) — one *memory-fast* call over the top ~20
      stage-B candidates that returns the ids of the truly relevant ones
-     (<=5). A parse/call failure falls back to the stage-B top-5; an
-     explicit "none of these are relevant" answer (valid empty list) is
-     honored as-is, not treated as a failure.
+     (<=5, further capped to the caller's ``k``). A parse/call failure
+     falls back to the stage-B top-k; an explicit "none of these are
+     relevant" answer (valid empty list) is honored as-is, not treated as
+     a failure.
 """
 
 import asyncio
@@ -307,8 +308,8 @@ async def _verify(
     message: str, candidates: List[Dict], owner: Optional[str], interactive: bool
 ) -> Optional[List[Dict]]:
     """Stage C. Returns None on parse/call failure (caller falls back to
-    stage-B top-5); an explicit empty `relevant_ids` is a legitimate answer
-    and is returned as `[]`, not treated as failure."""
+    the stage-B top-k); an explicit empty `relevant_ids` is a legitimate
+    answer and is returned as `[]`, not treated as failure."""
     if not candidates:
         return []
 
@@ -377,7 +378,11 @@ async def retrieve(
         ranked = _stage_b_rank(message, entries, effort, facets, memory_vector, pool_k=_VERIFY_POOL_SIZE)
         top_pool = ranked[:_VERIFY_POOL_SIZE]
         verified = await _verify(message, top_pool, owner=owner, interactive=interactive)
-        memories = verified if verified is not None else ranked[:5]
+        # Verify itself returns at most 5 (its own prompt-level cap on "how
+        # many are truly relevant"); this further caps to the caller's k so
+        # a k=3 chat-preface call doesn't inject 5 memories just because
+        # effort=high, same as the low/medium branch below already does.
+        memories = (verified if verified is not None else ranked)[:k]
     else:
         ranked = _stage_b_rank(message, entries, effort, facets, memory_vector, pool_k=k)
         memories = ranked[:k]
