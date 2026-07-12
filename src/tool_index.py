@@ -37,6 +37,13 @@ ALWAYS_AVAILABLE = frozenset({
     # of topic. Without this, RAG drops it and the agent falls back to
     # app_api /api/memory/add which fails with 422 on first attempt.
     "manage_memory",
+    # On-demand memory re-search. Like manage_memory, a "what do you know
+    # about X" / "check my memory" ask can follow any message regardless of
+    # topic; keeping it out of the always-set left it purely at the mercy of
+    # semantic RAG retrieval, so the agent frequently didn't have it and
+    # refused. Mirrors manage_memory's always-on baseline (gating in
+    # chat_routes' disabled_tools sets still withholds it when appropriate).
+    "retrieve_memory_context",
     # Ask the user a multiple-choice question for a decision/clarification.
     # Always reachable so the agent can pause and ask at any point.
     "ask_user",
@@ -50,7 +57,7 @@ ASSISTANT_ALWAYS_AVAILABLE = frozenset({
     "list_email_accounts", "list_emails", "read_email", "scan_email_unsubscribes", "unsubscribe_email", "send_email", "reply_to_email",
     "bulk_email", "archive_email", "delete_email", "mark_email_read",
     "manage_calendar", "manage_notes", "manage_tasks",
-    "manage_memory", "web_search", "read_file",
+    "manage_memory", "retrieve_memory_context", "web_search", "read_file",
     "create_document", "update_document",
     "resolve_contact", "search_chats",
     "api_call",  # For Miniflux/Gitea/Linkding/etc. integrations
