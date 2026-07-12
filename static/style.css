@@ -3449,27 +3449,6 @@ body.bg-pattern-sparkles {
       text-overflow: ellipsis;
       white-space: nowrap;
     }
-    .model-picker-list .model-switch-item .model-switch-ep {
-      flex: 0 1 auto;
-      min-width: 0;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-      font-size: 0.9em;
-      opacity: 0.45;
-    }
-    /* Raw filename, shown next to a friendly name (mp-model-name carries the
-       friendly name in that case). Same treatment as model-switch-ep. */
-    .model-picker-list .model-switch-item .mp-model-file {
-      flex: 0 1 auto;
-      min-width: 0;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-      font-size: 0.82em;
-      opacity: 0.4;
-      font-style: italic;
-    }
     /* Keyboard navigation highlight (Arrow keys in the search box). */
     .model-picker-list .model-switch-item.kb-active {
       background: color-mix(in srgb, var(--red) 14%, transparent);

@@ -498,28 +498,17 @@ function _initModelPickerDropdown() {
       const nameSpan = document.createElement('span');
       nameSpan.className = 'mp-model-name';
       nameSpan.textContent = m.display;
-      // Long model names are clipped with ellipsis — expose the full name on
-      // hover so the suffix/variant tag is still discoverable (#1982).
-      nameSpan.title = m.filename ? `${m.display} (${m.filename})` : m.display;
-      row.appendChild(nameSpan);
-      // Raw filename subtitle — only rendered when a friendly name (set via
-      // Cookbook launch / Admin panel) makes it differ from m.display.
-      if (m.filename) {
-        const fileSpan = document.createElement('span');
-        fileSpan.className = 'mp-model-file';
-        fileSpan.textContent = m.filename;
-        row.appendChild(fileSpan);
-      }
-      // Offline state is already conveyed by the row's reduced opacity —
-      // a redundant "offline" pill on top of that just added clutter.
-      // (Class kept on `row` so the opacity rule still applies; the text
-      // badge is gone.)
-      const epSpan = document.createElement('span');
-      epSpan.className = 'model-switch-ep';
-      // Don't show endpoint name if it matches the model name (local self-hosted)
+      // The row is one line and too narrow to also show the raw filename
+      // and endpoint name alongside a friendly name — that's exactly what
+      // got reported as "almost entirely cut off". Keep only the one label
+      // visible; filename + endpoint go in a hover tooltip instead.
+      // Don't show endpoint name if it matches the model name (local self-hosted).
       const _epDisplay = m.epName && !m.display.toLowerCase().includes(m.epName.toLowerCase().split('/').pop()) ? m.epName : '';
-      epSpan.textContent = _epDisplay;
-      row.appendChild(epSpan);
+      const _tooltipLines = [m.display];
+      if (m.filename) _tooltipLines.push(`File: ${m.filename}`);
+      if (_epDisplay) _tooltipLines.push(`Endpoint: ${_epDisplay}`);
+      nameSpan.title = _tooltipLines.join('\n');
+      row.appendChild(nameSpan);
 
       // Inline favorite dot — toggles favorite, never picks the model.
       const favDot = document.createElement('button');

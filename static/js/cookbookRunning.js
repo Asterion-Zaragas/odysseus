@@ -671,14 +671,26 @@ function _appendFriendlyLabel(fd, task) {
   if (label) fd.append('model_labels', JSON.stringify({ [label.modelId]: label.name }));
 }
 
-function _patchFriendlyLabel(epId, task) {
+async function _patchFriendlyLabel(epId, task) {
   const label = _friendlyLabelFor(task);
   if (!label || !epId) return;
-  fetch(`/api/model-endpoints/${epId}/models`, {
-    method: 'PATCH', credentials: 'same-origin',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ labels: { [label.modelId]: label.name } }),
-  }).catch(() => {});
+  try {
+    await fetch(`/api/model-endpoints/${epId}/models`, {
+      method: 'PATCH', credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ labels: { [label.modelId]: label.name } }),
+    });
+  } catch (_) {
+    return;
+  }
+  // Callers' own refresh right after this call is usually a non-forced
+  // `refreshModels(false)` — it can race this PATCH (fire, then refetch
+  // before the label commits) or simply no-op if the frontend's 30s model
+  // cache is still fresh, in which case the label would silently not show
+  // up until the cache aged out. Force one real re-fetch here so a just-set
+  // friendly name is visible right away.
+  if (window.modelsModule?.refreshModels) await window.modelsModule.refreshModels(true);
+  if (window.sessionModule?.updateModelPicker) window.sessionModule.updateModelPicker();
 }
 
 // ── Download queue — runs one at a time per server ──
@@ -2684,7 +2696,7 @@ export function _renderRunningTab() {
                 uiModule.showToast(`Already registered as "${existing.name}"`);
                 task._endpointAdded = true;
                 _updateTask(task.sessionId, { _endpointAdded: true });
-                _patchFriendlyLabel(existing.id, task);
+                await _patchFriendlyLabel(existing.id, task);
                 _refreshModelsAfterEndpointChange();
                 // If it's still offline (registered before the server finished
                 // loading), keep probing until it answers instead of leaving it
@@ -3674,7 +3686,7 @@ async function _reconnectTask(el, task) {
                 task._endpointAdded = true;
                 _updateTask(task.sessionId, { _endpointAdded: true });
                 _autoSaveWorkingConfig(task);   // endpoint live → remember these settings
-                _patchFriendlyLabel(_ex.id, task);
+                await _patchFriendlyLabel(_ex.id, task);
                 if (window.modelsModule?.refreshModels) await window.modelsModule.refreshModels(false);
                 if (window.sessionModule?.updateModelPicker) window.sessionModule.updateModelPicker();
                 window.dispatchEvent(new CustomEvent('ge:model-endpoints-updated', { detail: { baseUrl, host, port, model: task.name } }));
