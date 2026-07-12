@@ -1248,6 +1248,48 @@ def _normalize_model_ids(value):
     return out
 
 
+def _normalize_model_labels(value):
+    """Coerce a model-labels input into a clean dict of {model_id: label}.
+
+    Accepts a dict, or a JSON-encoded object string. Drops non-string keys/
+    values and empty labels; keys/values are trimmed.
+    """
+    if value is None:
+        return {}
+    obj = value
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return {}
+        try:
+            obj = json.loads(text)
+        except Exception:
+            return {}
+    if not isinstance(obj, dict):
+        return {}
+    out = {}
+    for k, v in obj.items():
+        if not isinstance(k, str) or not isinstance(v, str):
+            continue
+        key = k.strip()
+        val = v.strip()
+        if key and val:
+            out[key] = val
+    return out
+
+
+def _model_labels_dict(ep) -> dict:
+    """Read an endpoint's {model_id: friendly_name} map, tolerating bad JSON."""
+    raw = getattr(ep, "model_labels", None)
+    if not raw:
+        return {}
+    try:
+        obj = json.loads(raw)
+    except Exception:
+        return {}
+    return obj if isinstance(obj, dict) else {}
+
+
 def _merge_model_ids(*lists):
     """Concatenate model-ID lists, de-duplicating and preserving order."""
     out, seen = [], set()
@@ -1574,14 +1616,21 @@ def setup_model_routes(model_discovery):
                     if m not in curated:
                         curated.append(m)
                 extra = [m for m in extra if m not in pinned]
+                # Friendly names (Cookbook launch / Admin panel) take priority
+                # over the basename; models_*_filename always carries the raw
+                # basename so the UI can show it as a secondary line even when
+                # a friendly name is set.
+                labels = _model_labels_dict(ep)
                 items.append({
                     "host": "custom",
                     "port": 0,
                     "url": chat_url,
                     "models": curated,
-                    "models_display": [_model_display_name(mid) for mid in curated],
+                    "models_display": [labels.get(mid) or _model_display_name(mid) for mid in curated],
+                    "models_filename": [_model_display_name(mid) for mid in curated],
                     "models_extra": extra,
-                    "models_extra_display": [_model_display_name(mid) for mid in extra],
+                    "models_extra_display": [labels.get(mid) or _model_display_name(mid) for mid in extra],
+                    "models_extra_filename": [_model_display_name(mid) for mid in extra],
                     "endpoint_id": ep.id,
                     "endpoint_name": ep.name,
                     "category": category,
@@ -1596,8 +1645,10 @@ def setup_model_routes(model_discovery):
                     "url": chat_url,
                     "models": [],
                     "models_display": [],
+                    "models_filename": [],
                     "models_extra": [],
                     "models_extra_display": [],
+                    "models_extra_filename": [],
                     "endpoint_id": ep.id,
                     "endpoint_name": ep.name,
                     "category": category,
@@ -1994,6 +2045,7 @@ def setup_model_routes(model_discovery):
         model_refresh_timeout: str = Form(""),
         supports_tools: str = Form(""),  # "true"/"false"/"" (unknown)
         pinned_models: str = Form(""),  # admin-pinned IDs: list/JSON/comma/newline
+        model_labels: str = Form(""),  # JSON dict {model_id: friendly_name}
         container_local: str = Form("false"),
         # Default `shared=true` → endpoints are visible to all users (the
         # app's historical behaviour). Admins can pass `shared=false` to
@@ -2033,6 +2085,7 @@ def setup_model_routes(model_discovery):
         from src.auth_helpers import get_current_user as _gcu_dedup
         _caller = _gcu_dedup(request) or None
         _incoming_api_key = api_key.strip()
+        _incoming_labels = _normalize_model_labels(model_labels)
         _db_dedup = SessionLocal()
         try:
             _same_url_rows = (
@@ -2064,6 +2117,11 @@ def setup_model_routes(model_discovery):
                         _incoming_pinned,
                     )
                     existing.pinned_models = json.dumps(_merged_pinned) if _merged_pinned else None
+                    changed = True
+                if _incoming_labels:
+                    _merged_labels = _model_labels_dict(existing)
+                    _merged_labels.update(_incoming_labels)
+                    existing.model_labels = json.dumps(_merged_labels)
                     changed = True
                 existing_kind_for_probe = requested_kind if requested_kind != "auto" else _effective_endpoint_kind(existing, base_url)
                 if requested_kind != "auto" and _endpoint_kind(existing) == "auto":
@@ -2162,6 +2220,7 @@ def setup_model_routes(model_discovery):
                 model_refresh_timeout=refresh_timeout,
                 cached_models=json.dumps(model_ids) if model_ids else None,
                 pinned_models=json.dumps(_pinned) if _pinned else None,
+                model_labels=json.dumps(_incoming_labels) if _incoming_labels else None,
                 supports_tools=_st,
                 owner=_owner_val,
             )
@@ -2339,6 +2398,7 @@ def setup_model_routes(model_discovery):
             if picker_requires_pinning and not _has_explicit_pinned_models(ep):
                 pinned = _legacy_visible_api_models(ep)
             pinned_set = set(pinned)
+            labels = _model_labels_dict(ep)
             return [
                 {
                     "id": m,
@@ -2346,6 +2406,7 @@ def setup_model_routes(model_discovery):
                     "is_hidden": m in hidden,
                     "is_pinned": m in pinned_set,
                     "picker_requires_pinning": picker_requires_pinning,
+                    "label": labels.get(m, ""),
                 }
                 for m in _merge_model_ids(all_models, pinned)
             ]
@@ -2354,12 +2415,15 @@ def setup_model_routes(model_discovery):
 
     @router.patch("/model-endpoints/{ep_id}/models")
     async def update_hidden_models(ep_id: str, request: Request):
-        """Bulk update hidden and/or pinned model lists for an endpoint.
+        """Bulk update hidden/pinned model lists and/or friendly labels for an endpoint.
 
         Expects JSON body with optional keys:
-          {"hidden": ["model-id-1", ...], "pinned_models": ["deploy-id", ...]}
-        Each key is updated only when present, so callers can patch one list
-        without clobbering the other.
+          {"hidden": ["model-id-1", ...], "pinned_models": ["deploy-id", ...],
+           "labels": {"model-id-1": "My Coding Model", "model-id-2": ""}}
+        Each key is updated only when present, so callers can patch one
+        list/dict without clobbering the others. "labels" is merged by key —
+        an empty string clears that model's label (falls back to filename)
+        without touching any other model's label.
         """
         require_admin(request)
         db = SessionLocal()
@@ -2389,18 +2453,31 @@ def setup_model_routes(model_discovery):
             # Accept either "pinned" or "pinned_models" for the manual IDs list.
             if "pinned_models" in body or "pinned" in body:
                 pinned = _normalize_model_ids(body.get("pinned_models", body.get("pinned")))
-                base = _normalize_base(ep.base_url)
-                kind = _effective_endpoint_kind(ep, base)
-                if _picker_requires_pinning(base, kind):
-                    ep.pinned_models = json.dumps(pinned)
-                    ep.hidden_models = None
-                else:
-                    ep.pinned_models = json.dumps(pinned) if pinned else None
+                ep.pinned_models = json.dumps(pinned) if pinned else None
+            if "labels" in body:
+                incoming_labels = body.get("labels")
+                if not isinstance(incoming_labels, dict):
+                    raise HTTPException(400, "labels must be an object of {model_id: name}")
+                labels = _model_labels_dict(ep)
+                for mid, label in incoming_labels.items():
+                    if not isinstance(mid, str):
+                        continue
+                    label_text = label.strip() if isinstance(label, str) else ""
+                    if label_text:
+                        labels[mid] = label_text
+                    else:
+                        labels.pop(mid, None)
+                ep.model_labels = json.dumps(labels) if labels else None
             db.commit()
             _invalidate_models_cache()
             hidden_count = len(json.loads(ep.hidden_models)) if ep.hidden_models else 0
             pinned_count = len(json.loads(ep.pinned_models)) if ep.pinned_models else 0
-            return {"id": ep_id, "hidden_count": hidden_count, "pinned_count": pinned_count}
+            return {
+                "id": ep_id,
+                "hidden_count": hidden_count,
+                "pinned_count": pinned_count,
+                "model_labels": _model_labels_dict(ep),
+            }
         finally:
             db.close()
 

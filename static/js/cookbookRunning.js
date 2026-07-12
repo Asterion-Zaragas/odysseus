@@ -654,6 +654,31 @@ function _appendPinnedServeModel(fd, task) {
 function _isImageServeTask(task) {
   const cmd = String(task?.payload?._cmd || '');
   return cmd.includes('diffusion_server') || cmd.includes('mlx_image_server');
+// Cosmetic per-model display name typed into the Cookbook serve panel's
+// "Friendly name" field — threads it onto the model-endpoint row being
+// created so the chat model picker shows it (friendly name first, raw
+// filename second) instead of just the served model id/filename.
+function _friendlyLabelFor(task) {
+  const name = String(task?.payload?._fields?.friendly_name || '').trim();
+  if (!name) return null;
+  const modelId = _serveExpectedModel(task);
+  if (!modelId) return null;
+  return { modelId, name };
+}
+
+function _appendFriendlyLabel(fd, task) {
+  const label = _friendlyLabelFor(task);
+  if (label) fd.append('model_labels', JSON.stringify({ [label.modelId]: label.name }));
+}
+
+function _patchFriendlyLabel(epId, task) {
+  const label = _friendlyLabelFor(task);
+  if (!label || !epId) return;
+  fetch(`/api/model-endpoints/${epId}/models`, {
+    method: 'PATCH', credentials: 'same-origin',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ labels: { [label.modelId]: label.name } }),
+  }).catch(() => {});
 }
 
 // ── Download queue — runs one at a time per server ──
@@ -2659,6 +2684,7 @@ export function _renderRunningTab() {
                 uiModule.showToast(`Already registered as "${existing.name}"`);
                 task._endpointAdded = true;
                 _updateTask(task.sessionId, { _endpointAdded: true });
+                _patchFriendlyLabel(existing.id, task);
                 _refreshModelsAfterEndpointChange();
                 // If it's still offline (registered before the server finished
                 // loading), keep probing until it answers instead of leaving it
@@ -2672,6 +2698,9 @@ export function _renderRunningTab() {
               fd.append('skip_probe', 'true');
               _appendCookbookEndpointScope(fd, task.remoteHost || '');
               if (_isImageServeTask(task)) fd.append('model_type', 'image');
+              _appendPinnedServeModel(fd, task);
+              _appendFriendlyLabel(fd, task);
+              if (task.payload?._cmd?.includes('diffusion_server')) fd.append('model_type', 'image');
               const res = await fetch('/api/model-endpoints', { method: 'POST', credentials: 'same-origin', body: fd });
               if (res.ok) {
                 task._endpointAdded = true;
@@ -3645,6 +3674,7 @@ async function _reconnectTask(el, task) {
                 task._endpointAdded = true;
                 _updateTask(task.sessionId, { _endpointAdded: true });
                 _autoSaveWorkingConfig(task);   // endpoint live → remember these settings
+                _patchFriendlyLabel(_ex.id, task);
                 if (window.modelsModule?.refreshModels) await window.modelsModule.refreshModels(false);
                 if (window.sessionModule?.updateModelPicker) window.sessionModule.updateModelPicker();
                 window.dispatchEvent(new CustomEvent('ge:model-endpoints-updated', { detail: { baseUrl, host, port, model: task.name } }));
@@ -3658,6 +3688,7 @@ async function _reconnectTask(el, task) {
               fd.append('skip_probe', 'true');
               _appendCookbookEndpointScope(fd, task.remoteHost || '');
               _appendPinnedServeModel(fd, task);
+              _appendFriendlyLabel(fd, task);
               if (_isDiffusion) fd.append('model_type', 'image');
               return fetch('/api/model-endpoints', { method: 'POST', credentials: 'same-origin', body: fd });
             })
@@ -4308,6 +4339,7 @@ async function _pollBackgroundStatus() {
             // Already registered — but it may be showing offline because
             // it was added while the server was still warming. Kick a
             // re-probe so it flips online without manual toggle.
+            _patchFriendlyLabel(existing.id, taskForMatch);
             if (!(existing.models || []).length) _probeEndpointUntilOnline(existing.id, host, port);
             return null;
           }
@@ -4317,6 +4349,7 @@ async function _pollBackgroundStatus() {
           fd.append('skip_probe', 'true');
           _appendCookbookEndpointScope(fd, localTask?.remoteHost || t.remote || '');
           _appendPinnedServeModel(fd, localTask || { name: t.model, model: t.model, payload: { repo_id: t.model, _cmd } });
+          _appendFriendlyLabel(fd, localTask || { name: t.model, model: t.model, payload: { repo_id: t.model, _cmd } });
           if (_isDiffusion) fd.append('model_type', 'image');
           if (_supportsTools) fd.append('supports_tools', 'true');
           return fetch('/api/model-endpoints', { method: 'POST', credentials: 'same-origin', body: fd });

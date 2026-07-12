@@ -1845,6 +1845,24 @@ body.bg-pattern-sparkles {
       text-overflow: clip;
       white-space: nowrap;
     }
+    /* Two-line model row label — friendly name (primary) stacked over the
+       raw filename (dim subtitle), shown only when a friendly name is set. */
+    .models-row .grow.models-row-name {
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      gap: 1px;
+    }
+    .models-row-name-primary,
+    .models-row-name-sub {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .models-row-name-sub {
+      font-size: 0.78em;
+      opacity: 0.5;
+    }
     input, textarea, button, select {
       background:var(--bg);
       color:var(--fg);
@@ -3439,6 +3457,18 @@ body.bg-pattern-sparkles {
       white-space: nowrap;
       font-size: 0.9em;
       opacity: 0.45;
+    }
+    /* Raw filename, shown next to a friendly name (mp-model-name carries the
+       friendly name in that case). Same treatment as model-switch-ep. */
+    .model-picker-list .model-switch-item .mp-model-file {
+      flex: 0 1 auto;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: 0.82em;
+      opacity: 0.4;
+      font-style: italic;
     }
     /* Keyboard navigation highlight (Arrow keys in the search box). */
     .model-picker-list .model-switch-item.kb-active {
@@ -15398,6 +15428,27 @@ body:has(.doc-version-panel:not(.hidden)) .hamburger-btn {
 }
 .adm-cb-hidden:checked + .adm-check-dot::after {
   transform: translate(-50%, -50%) rotate(-45deg) scale(1);
+}
+/* Friendly-name field inside a model row — fixed width so it doesn't crowd
+   out the (already ellipsis-truncated) model id span next to it. */
+.adm-model-row .adm-label-input {
+  flex: 0 0 130px;
+  min-width: 0;
+  font-size: 10px;
+  padding: 2px 4px;
+  background: transparent;
+  border: none;
+  border-bottom: 1px solid color-mix(in srgb, var(--fg) 20%, transparent);
+  color: var(--fg);
+  text-align: right;
+  cursor: text;
+}
+.adm-model-row .adm-label-input:focus {
+  outline: none;
+  border-bottom-color: var(--accent, var(--red));
+}
+.adm-model-row .adm-label-input::placeholder {
+  color: color-mix(in srgb, var(--fg) 30%, transparent);
 }
 /* Disabled endpoints — dim the row but keep the toggle/delete buttons
    at full opacity so the user can re-enable or remove without squinting. */

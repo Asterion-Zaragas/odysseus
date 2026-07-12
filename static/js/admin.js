@@ -717,6 +717,7 @@ async function loadEndpoints() {
                 <input type="checkbox" class="adm-cb-hidden" data-ep-model-id="${esc(m.id)}" ${(usesPinnedPicker ? m.is_pinned : !m.is_hidden) ? 'checked' : ''}>
                 <span class="adm-check-dot" aria-hidden="true"></span>
                 <span>${esc(m.display)}</span>
+                <input type="text" class="adm-label-input" data-ep-model-id="${esc(m.id)}" value="${esc(m.label || '')}" placeholder="Friendly name" title="Cosmetic name shown in the chat model picker (filename still shows underneath); blank falls back to the filename." />
               </label>`
             ).join('') + '</div>';
             const filterRows = (q) => {
@@ -743,6 +744,15 @@ async function loadEndpoints() {
             });
             panel.querySelectorAll('input[type=checkbox]').forEach(cb => {
               cb.addEventListener('change', () => _saveEpModelState(epId, panel));
+            });
+            // Clicking into the text input must not toggle the row's
+            // checkbox (browsers already exempt other form controls nested
+            // in a <label> from forwarding the click, but stop propagation
+            // too so the outer header's expand/collapse handler is unaffected).
+            panel.querySelectorAll('.adm-label-input').forEach(inp => {
+              inp.addEventListener('click', (e) => e.stopPropagation());
+              inp.addEventListener('change', () => _saveModelLabel(epId, inp.dataset.epModelId, inp.value));
+              inp.addEventListener('keydown', (e) => { if (e.key === 'Enter') inp.blur(); });
             });
           };
           try {
@@ -792,6 +802,22 @@ async function _saveEpModelState(epId, panel) {
       settingsModule.refreshAiModelEndpoints();
     }
     _refreshAfterEndpointChange();
+  } catch (e) { /* silent */ }
+}
+
+async function _saveModelLabel(epId, modelId, value) {
+  try {
+    await fetch(`/api/model-endpoints/${epId}/models`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify({ labels: { [modelId]: value } }),
+    });
+    // Friendly names feed the chat model picker (models_display), not
+    // anything rendered in this admin panel itself — refresh those caches
+    // so the change is visible without a manual reload.
+    if (window.modelsModule && window.modelsModule.refreshModels) window.modelsModule.refreshModels(true);
+    if (window.sessionModule && window.sessionModule.updateModelPicker) window.sessionModule.updateModelPicker();
   } catch (e) { /* silent */ }
 }
 

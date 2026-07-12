@@ -287,6 +287,7 @@ function _initModelPickerDropdown() {
       const epOffline = !!item.offline;
       const allModels = (item.models || []).concat(item.models_extra || []);
       const allDisplay = (item.models_display || []).concat(item.models_extra_display || []);
+      const allFilenames = (item.models_filename || []).concat(item.models_extra_filename || []);
       // Mark local endpoints whose live probe failed.
       const probeResult = item.endpoint_id ? _localProbe[item.endpoint_id] : null;
       const isLocalDead = !!(probeResult && probeResult.alive === false);
@@ -302,10 +303,20 @@ function _initModelPickerDropdown() {
           : mid;
         if (seen.has(seenKey)) return;
         seen.add(seenKey);
+        // Deduplicate by model ID — prefer ONLINE endpoint entries over
+        // offline duplicates so the user gets a working endpoint first
+        // when the same model is exposed by both.
+        if (seen.has(mid)) return;
+        seen.add(mid);
+        const display = (allDisplay[i] || mid).split('/').pop();
+        const filename = (allFilenames[i] || mid).split('/').pop();
         result.push({
           key: seenKey,
           mid,
-          display: (allDisplay[i] || mid).split('/').pop(),
+          display,
+          // Only a real secondary line when a friendly name actually diverges
+          // from the raw filename — otherwise there's nothing extra to show.
+          filename: filename !== display ? filename : '',
           url: item.url,
           endpointId: item.endpoint_id,
           epName: item.endpoint_name || '',
@@ -489,8 +500,16 @@ function _initModelPickerDropdown() {
       nameSpan.textContent = m.display;
       // Long model names are clipped with ellipsis — expose the full name on
       // hover so the suffix/variant tag is still discoverable (#1982).
-      nameSpan.title = m.display;
+      nameSpan.title = m.filename ? `${m.display} (${m.filename})` : m.display;
       row.appendChild(nameSpan);
+      // Raw filename subtitle — only rendered when a friendly name (set via
+      // Cookbook launch / Admin panel) makes it differ from m.display.
+      if (m.filename) {
+        const fileSpan = document.createElement('span');
+        fileSpan.className = 'mp-model-file';
+        fileSpan.textContent = m.filename;
+        row.appendChild(fileSpan);
+      }
       // Offline state is already conveyed by the row's reduced opacity —
       // a redundant "offline" pill on top of that just added clutter.
       // (Class kept on `row` so the opacity rule still applies; the text
@@ -945,7 +964,25 @@ export function updateModelPicker() {
     _ensureDefaultPendingChat();
   }
 
-  const displayName = modelId ? modelId.split('/').pop() : 'Select model';
+  let displayName = modelId ? modelId.split('/').pop() : 'Select model';
+  // Prefer the endpoint's friendly name (Cookbook launch / Admin panel) over
+  // the raw basename, matching what the dropdown itself shows for this model.
+  if (modelId && window.modelsModule && window.modelsModule.getCachedItems) {
+    const items = window.modelsModule.getCachedItems();
+    outer:
+    for (const item of items) {
+      const idxMain = (item.models || []).indexOf(modelId);
+      if (idxMain >= 0) {
+        displayName = (item.models_display || [])[idxMain] || displayName;
+        break outer;
+      }
+      const idxExtra = (item.models_extra || []).indexOf(modelId);
+      if (idxExtra >= 0) {
+        displayName = (item.models_extra_display || [])[idxExtra] || displayName;
+        break outer;
+      }
+    }
+  }
   // The header indicator clips long names with ellipsis; show the full model
   // identifier on hover (#1982). No tooltip on the "Select model" placeholder.
   label.title = modelId || '';
