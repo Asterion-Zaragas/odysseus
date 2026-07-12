@@ -368,6 +368,29 @@ class ToolIndex:
                    "check on that job", "job output", "kill the job",
                    "kill the background", "stop the background", "running job"}):
             {"manage_bg_jobs"},
+        # Local file / code / shell work. The file tools are NOT in
+        # ALWAYS_AVAILABLE and had no keyword-hint entry, so when the tool
+        # index (ChromaDB) is unavailable the ONLY thing that surfaced them
+        # was the agent-loop "files" intent regex — phrasings like "the
+        # project" / "this folder" that name no file/shell verb missed
+        # entirely and the agent reported it had no file tools. Mirror the
+        # agent-loop `_DOMAIN_TOOL_MAP["files"]` set here so the
+        # keyword-fallback path (RAG down) covers them too. Keywords chosen
+        # to be safe as BOTH a word-boundary match (get_tools_for_query) and
+        # a raw-substring match (agent_loop keyword fallback) — no short
+        # fragment that fires inside an unrelated word.
+        frozenset({"file on disk", "read file", "read the file", "read a file",
+                   "open the file", "edit file", "edit the file", "write file",
+                   "create a file", "the file", "this file", "source file",
+                   "folder", "directory", "the repo", "the repository",
+                   "codebase", "code base", "source code", "the project",
+                   "this project", "my project", "our project",
+                   "this folder", "the folder", "my folder", "working directory",
+                   "grep", "ripgrep", "terminal", "command line",
+                   "shell command", "shell script", "bash script",
+                   "run a command"}):
+            {"bash", "python", "read_file", "write_file", "edit_file",
+             "grep", "glob", "ls", "get_workspace", "manage_bg_jobs"},
         frozenset({"note", "todo", "reminder", "remind", "checklist", "remember to"}):
             {"manage_notes"},
         # Chat/session management. "rename" alone maps to documents below, so a

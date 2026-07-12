@@ -1333,7 +1333,16 @@ def _classify_agent_request(messages: List[Dict], last_user: str) -> Dict[str, o
         domains.add("ui")
     if has(r"\b(session|chat history|rename chat|delete chat|archive chat|fork chat|list chats)\b"):
         domains.add("sessions")
-    if has(r"\b(file|folder|directory|repo|git|grep|find in files|read file|edit file|shell|terminal|bash)\b"):
+    if has(
+        r"\b(file|folder|directory|repo|repository|codebase|code ?base|source code|git|grep|find in files|read file|edit file|shell|terminal|command line|bash|(?:the|this|my|our) project|(?:this|the|my) folder|working directory)\b",
+        # A bare filename with a code/config extension is a strong file
+        # signal even when no file/shell verb is present ("look at main.py",
+        # "what's in config.yaml"). Extensions only, so it doesn't fire on
+        # version numbers ("3.5") or abbreviations ("e.g."); a URL that
+        # happens to end in a listed extension surfacing file tools is
+        # harmless (the web domain still fires alongside).
+        r"\b[\w./-]+\.(py|js|ts|jsx|tsx|go|rs|java|rb|c|cpp|cc|h|hpp|cs|php|swift|kt|sh|sql|json|ya?ml|toml|ini|cfg|md|txt|csv|html?|css|xml)\b",
+    ):
         domains.add("files")
     if has(
         r"\b(run|execute|test|debug|fix|save|create|edit|read|open)\b.{0,40}\b("
