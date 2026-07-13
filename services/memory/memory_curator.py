@@ -281,7 +281,7 @@ def _needs_triage(entry: Dict) -> bool:
     return entry.get("generality") is None or bool(entry.get("provisional_tags"))
 
 
-async def _triage_batch(batch: List[Dict], owner: Optional[str], dry_run: bool) -> List[Tuple[str, Dict, Dict]]:
+async def _triage_batch(batch: List[Dict], owner: Optional[str], dry_run: bool, interactive: bool = False) -> List[Tuple[str, Dict, Dict]]:
     """Mutates entries in `batch` in place; returns a list of
     (action, before_snapshot, after_snapshot) tuples for the changelog."""
     from src.memory import normalize_tags
@@ -303,7 +303,8 @@ async def _triage_batch(batch: List[Dict], owner: Optional[str], dry_run: bool) 
     ]
     try:
         raw = await memory_llm_call_async(
-            "smart", messages, owner=owner, temperature=0.1, max_tokens=TRIAGE_MAX_TOKENS,
+            "smart", messages, owner=owner, interactive=interactive,
+            temperature=0.1, max_tokens=TRIAGE_MAX_TOKENS,
         )
     except Exception as e:
         logger.warning("Curator triage batch failed for owner=%r: %s", owner, e)
@@ -341,10 +342,10 @@ async def _triage_batch(batch: List[Dict], owner: Optional[str], dry_run: bool) 
     return actions
 
 
-async def _run_triage_pass(entries: List[Dict], owner: Optional[str], batch_size: int, dry_run: bool) -> List[Dict]:
+async def _run_triage_pass(entries: List[Dict], owner: Optional[str], batch_size: int, dry_run: bool, interactive: bool = False) -> List[Dict]:
     pending = [e for e in entries if _needs_triage(e)]
     for batch in cluster_batches(pending, batch_size):
-        actions = await _triage_batch(batch, owner, dry_run)
+        actions = await _triage_batch(batch, owner, dry_run, interactive)
         for action, before, after in actions:
             _log_action(owner, action, before=before, after=after, dry_run=dry_run)
     return entries
@@ -382,7 +383,7 @@ _UNSAFE_REMOVAL_MIN_BATCH = 8
 _UNSAFE_REMOVAL_RATIO = 0.5
 
 
-async def _dedupe_batch(batch: List[Dict], owner: Optional[str]) -> Tuple[List[Dict], List[Tuple[str, list, list]]]:
+async def _dedupe_batch(batch: List[Dict], owner: Optional[str], interactive: bool = False) -> Tuple[List[Dict], List[Tuple[str, list, list]]]:
     """Returns (surviving_entries, changelog_actions). Never raises; any
     failure or unsafe-looking result returns the batch unchanged."""
     if len(batch) < 2:
@@ -398,7 +399,8 @@ async def _dedupe_batch(batch: List[Dict], owner: Optional[str]) -> Tuple[List[D
     ]
     try:
         raw = await memory_llm_call_async(
-            "smart", messages, owner=owner, temperature=0.1, max_tokens=DEDUPE_MAX_TOKENS, timeout=120,
+            "smart", messages, owner=owner, interactive=interactive,
+            temperature=0.1, max_tokens=DEDUPE_MAX_TOKENS, timeout=120,
         )
     except Exception as e:
         logger.warning("Curator dedupe batch failed for owner=%r: %s", owner, e)
@@ -442,10 +444,10 @@ async def _dedupe_batch(batch: List[Dict], owner: Optional[str]) -> Tuple[List[D
     return final, actions
 
 
-async def _run_dedupe_pass(entries: List[Dict], owner: Optional[str], batch_size: int, dry_run: bool) -> List[Dict]:
+async def _run_dedupe_pass(entries: List[Dict], owner: Optional[str], batch_size: int, dry_run: bool, interactive: bool = False) -> List[Dict]:
     survivors: List[Dict] = []
     for batch in cluster_batches(entries, batch_size):
-        final, actions = await _dedupe_batch(batch, owner)
+        final, actions = await _dedupe_batch(batch, owner, interactive)
         survivors.extend(final)
         for action, before, after in actions:
             _log_action(owner, action, before=before, after=after, dry_run=dry_run)
@@ -477,7 +479,7 @@ def _tag_counts(entries: List[Dict]) -> Dict[str, int]:
     return counts
 
 
-async def _propose_tag_merges(tag_counts: Dict[str, int], owner: Optional[str]) -> List[Tuple[str, str]]:
+async def _propose_tag_merges(tag_counts: Dict[str, int], owner: Optional[str], interactive: bool = False) -> List[Tuple[str, str]]:
     if len(tag_counts) < 2:
         return []
 
@@ -491,7 +493,8 @@ async def _propose_tag_merges(tag_counts: Dict[str, int], owner: Optional[str]) 
     ]
     try:
         raw = await memory_llm_call_async(
-            "smart", messages, owner=owner, temperature=0.1, max_tokens=TAG_MERGE_MAX_TOKENS,
+            "smart", messages, owner=owner, interactive=interactive,
+            temperature=0.1, max_tokens=TAG_MERGE_MAX_TOKENS,
         )
     except Exception as e:
         logger.warning("Curator tag-merge proposal failed for owner=%r: %s", owner, e)
@@ -563,10 +566,10 @@ def build_registry(entries: List[Dict], cap: int, protected: Set[str], existing_
 
 
 async def _run_tag_normalize_pass(
-    entries: List[Dict], owner: Optional[str], cap: int, protected: Set[str], dry_run: bool,
+    entries: List[Dict], owner: Optional[str], cap: int, protected: Set[str], dry_run: bool, interactive: bool = False,
 ) -> List[Dict]:
     counts = _tag_counts(entries)
-    merges = await _propose_tag_merges(counts, owner)
+    merges = await _propose_tag_merges(counts, owner, interactive)
     applied = _apply_tag_merges(entries, merges, protected)
     for frm, into in applied:
         _log_action(owner, "retag", before={"tag": frm}, after={"tag": into}, dry_run=dry_run)
@@ -628,7 +631,7 @@ CONTEXT_SUMMARY_MAX_TOKENS = 1024
 _MAX_CORE_FACTS = 30
 
 
-async def _summarize_core_facts(texts: List[str], owner: Optional[str]) -> List[str]:
+async def _summarize_core_facts(texts: List[str], owner: Optional[str], interactive: bool = False) -> List[str]:
     texts = list(dict.fromkeys(t.strip() for t in texts if t and t.strip()))
     if not texts:
         return []
@@ -641,7 +644,8 @@ async def _summarize_core_facts(texts: List[str], owner: Optional[str]) -> List[
     ]
     try:
         raw = await memory_llm_call_async(
-            "smart", messages, owner=owner, temperature=0.1, max_tokens=CONTEXT_SUMMARY_MAX_TOKENS,
+            "smart", messages, owner=owner, interactive=interactive,
+            temperature=0.1, max_tokens=CONTEXT_SUMMARY_MAX_TOKENS,
         )
         parsed = _parse_json_array(raw)
         if parsed:
@@ -654,7 +658,7 @@ async def _summarize_core_facts(texts: List[str], owner: Optional[str]) -> List[
 
 
 async def _run_context_doc_pass(
-    owner: Optional[str], entries: List[Dict], cap: int, protected: Set[str], dry_run: bool,
+    owner: Optional[str], entries: List[Dict], cap: int, protected: Set[str], dry_run: bool, interactive: bool = False,
 ) -> Dict:
     from services.memory.memory_context import MemoryContext
 
@@ -663,7 +667,7 @@ async def _run_context_doc_pass(
     registry = build_registry(entries, cap, protected, existing_registry=doc.get("tag_registry"))
 
     core_pinned = [e for e in entries if e.get("tier") == TIER_CORE or e.get("pinned")]
-    core_facts = await _summarize_core_facts([e.get("text", "") for e in core_pinned], owner)
+    core_facts = await _summarize_core_facts([e.get("text", "") for e in core_pinned], owner, interactive)
 
     stats = {
         "total": len(entries),
@@ -678,13 +682,22 @@ async def _run_context_doc_pass(
 
 # ---- orchestrator ----
 
-async def curate(memory_manager, memory_vector, owner: Optional[str] = None, dry_run: bool = False) -> Dict:
+async def curate(memory_manager, memory_vector, owner: Optional[str] = None, dry_run: bool = False, interactive: bool = False) -> Dict:
     """Run the full curator pipeline for one owner.
 
     Never raises: a per-batch LLM failure degrades that batch to a no-op
     (see `_triage_batch` / `_dedupe_batch` / `_propose_tag_merges`); this
     function itself can still raise on genuine programming errors, but no
     LLM/network failure should propagate past it.
+
+    `interactive` selects the LLM foreground-gate mode for every memory-smart
+    call the passes make. The nightly loop runs genuinely backgrounded
+    (`interactive=False`, waits for foreground quiet). The manual
+    `/api/memory/audit` route runs `curate()` INLINE inside its own tracked
+    HTTP request, so it MUST pass `interactive=True`: with `False` the gate
+    would wait for `_ACTIVE_REQUESTS == 0`, which includes the audit request
+    itself, deadlocking the run (button stuck on "Running…", no LLM call ever
+    issued).
     """
     from src.settings import get_setting
 
@@ -730,17 +743,17 @@ async def curate(memory_manager, memory_vector, owner: Optional[str] = None, dry
     for idx in range(start_idx, len(PASS_ORDER)):
         pass_name = PASS_ORDER[idx]
         if pass_name == "triage":
-            entries = await _run_triage_pass(entries, owner, batch_size, dry_run)
+            entries = await _run_triage_pass(entries, owner, batch_size, dry_run, interactive)
         elif pass_name == "dedupe":
-            entries = await _run_dedupe_pass(entries, owner, batch_size, dry_run)
+            entries = await _run_dedupe_pass(entries, owner, batch_size, dry_run, interactive)
         elif pass_name == "tag_normalize":
-            entries = await _run_tag_normalize_pass(entries, owner, cap, protected, dry_run)
+            entries = await _run_tag_normalize_pass(entries, owner, cap, protected, dry_run, interactive)
         elif pass_name == "rescore":
             entries = _run_rescore_pass(entries, owner, dry_run)
         elif pass_name == "expire":
             entries = _run_expire_pass(entries, owner, protected, expiry_days, dry_run)
         elif pass_name == "context_doc":
-            await _run_context_doc_pass(owner, entries, cap, protected, dry_run)
+            await _run_context_doc_pass(owner, entries, cap, protected, dry_run, interactive)
         if not dry_run:
             # Write-ahead ordering: a completed pass's mutations MUST be on
             # disk before the checkpoint marks it done. curate() only ever

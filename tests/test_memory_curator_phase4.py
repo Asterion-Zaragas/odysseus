@@ -224,6 +224,55 @@ async def test_curate_full_pipeline_runs_all_passes(_isolated_dirs, monkeypatch)
         assert doc["tag_registry"]  # rebuilt
 
 
+async def test_curate_threads_interactive_flag_to_smart_calls(_isolated_dirs, monkeypatch):
+    """Regression for the manual-curator deadlock (bugs/2026-07-13-curator-
+    manual-run-deadlock.md): the /api/memory/audit route runs curate() INLINE
+    inside its own tracked HTTP request, so it passes interactive=True and every
+    memory-smart call must inherit it (interactive=False there waits for the
+    request count to hit zero — i.e. waits on the audit request itself, and
+    deadlocks). Verify curate() threads its interactive flag through every pass
+    to memory_llm_call_async, for both True (manual route) and False (nightly)."""
+    import json
+
+    for flag in (True, False):
+        with tempfile.TemporaryDirectory() as d:
+            mgr = MemoryManager(d)
+            e1 = mgr.add_entry("User likes tea", owner="alice")
+            e1["generality"] = None
+            e1["provisional_tags"] = ["morning"]
+            e1["tags"] = ["drinks", "tea"]
+            e2 = mgr.add_entry("User enjoys coffee", owner="alice")
+            e2["generality"] = None
+            e2["tags"] = ["drinks", "coffee"]
+            e2["tier"] = 0  # core → triggers the context-doc summary call too
+            mgr.save([e1, e2])
+
+            seen = []
+
+            async def fake_llm(role, messages, owner=None, interactive=False, **kwargs):
+                seen.append(interactive)
+                sys = messages[0]["content"]
+                if "promote_tags" in sys:            # triage
+                    return "[]"
+                if '"from"' in sys and '"into"' in sys:  # tag-merge
+                    return "[]"
+                if "duplicate" in sys.lower() or "MERGE" in sys:  # dedupe: keep both
+                    return json.dumps(
+                        [{"id": e["id"], "text": e["text"], "tags": e.get("tags", [])} for e in (e1, e2)]
+                    )
+                return "[]"                          # context-facts summary etc.
+
+            monkeypatch.setattr("src.task_endpoint.memory_llm_call_async", fake_llm)
+
+            # dry_run=True runs the full real pipeline (all LLM calls) without
+            # persisting — exactly the "Preview" path, and it skips the
+            # fingerprint short-circuit so the passes always execute.
+            await cur.curate(mgr, None, owner="alice", dry_run=True, interactive=flag)
+
+            assert seen, "expected at least one memory-smart call"
+            assert all(v is flag for v in seen), f"expected every call interactive={flag}, got {seen}"
+
+
 async def test_curate_second_run_short_circuits_on_fingerprint(_isolated_dirs, monkeypatch):
     with tempfile.TemporaryDirectory() as d:
         mgr = MemoryManager(d)

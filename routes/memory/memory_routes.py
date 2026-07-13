@@ -326,7 +326,12 @@ def setup_memory_routes(memory_manager: MemoryManager, session_manager: SessionM
         proposed actions without writing anything back.
         """
         user = _owner(request)
-        result = await curate(memory_manager, memory_vector, owner=user, dry_run=dry_run)
+        # interactive=True: this runs INLINE inside the audit request, which is
+        # itself counted in the interactive gate's active-request tally. Passing
+        # False (the nightly-loop default) would make curate()'s memory-smart
+        # calls wait for the request count to hit zero — i.e. wait on this very
+        # request — and deadlock (button stuck on "Running…", no LLM call made).
+        result = await curate(memory_manager, memory_vector, owner=user, dry_run=dry_run, interactive=True)
 
         return {
             "ok": True,

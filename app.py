@@ -1266,7 +1266,12 @@ async def _startup_event():
                 from services.memory.memory_curator import curate, list_owners
                 for owner in list_owners(memory_manager):
                     try:
-                        result = await curate(memory_manager, memory_vector, owner=owner, dry_run=dry_run)
+                        # interactive=False: the nightly loop is genuinely
+                        # backgrounded (no HTTP request wrapping it), so its
+                        # memory-smart calls correctly wait for foreground quiet.
+                        # (The manual /api/memory/audit route passes True — see
+                        # curate()'s docstring for why the inline path must.)
+                        result = await curate(memory_manager, memory_vector, owner=owner, dry_run=dry_run, interactive=False)
                         mode = "dry-run preview" if dry_run else "applied"
                         logger.info(f"Nightly memory curation for {owner or '(legacy)'} ({mode}): {result}")
                     except Exception as e:

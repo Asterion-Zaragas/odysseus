@@ -95,15 +95,18 @@ def test_audit_calls_curator_for_the_caller_owner(monkeypatch):
 
     curate_calls = []
 
-    async def fake_curate(memory_manager_arg, memory_vector_arg, owner=None, dry_run=False):
-        curate_calls.append((memory_manager_arg, memory_vector_arg, owner, dry_run))
+    async def fake_curate(memory_manager_arg, memory_vector_arg, owner=None, dry_run=False, interactive=False):
+        curate_calls.append((memory_manager_arg, memory_vector_arg, owner, dry_run, interactive))
         return {"before": 2, "after": 1, "already_tidy": False}
 
     monkeypatch.setattr(mr, "curate", fake_curate)
 
     out = asyncio.run(audit_route(request=_request("alice"), dry_run=True))
 
-    assert curate_calls == [(memory_manager, memory_vector, "alice", True)]
+    # The manual audit route must run curate() with interactive=True — it is
+    # called inline inside this HTTP request, so the background gate default
+    # (False) would self-deadlock.
+    assert curate_calls == [(memory_manager, memory_vector, "alice", True, True)]
     assert out["ok"] is True
     assert out["removed"] == 1
     assert out["dry_run"] is True
