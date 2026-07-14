@@ -46,16 +46,14 @@ async def _local_model_slot(target_url: str, model: str, workload: Optional[str]
     kind = _gate_workload(workload)
     current_task = asyncio.current_task()
     if kind == "foreground":
+        # Mark a foreground caller as waiting so newly-arriving background
+        # work defers (the background loop below checks this counter). An
+        # in-flight background call is NOT cancelled — it finishes its
+        # current generation and the foreground caller queues behind it on
+        # the lock, so paused background work (e.g. the nightly curator)
+        # resumes intact after the foreground burst instead of losing the
+        # batch it was mid-way through.
         _LOCAL_MODEL_WAITING_FOREGROUND += 1
-        current = dict(_LOCAL_MODEL_CURRENT)
-        if current.get("workload") == "background":
-            task = current.get("task")
-            if isinstance(task, asyncio.Task) and not task.done():
-                logger.info(
-                    "[model-gate] cancelling background local model call for foreground request model=%s",
-                    model,
-                )
-                task.cancel()
     else:
         # Background work should not jump in while the browser/chat is active
         # or while a foreground request is waiting to acquire the local model.
@@ -82,7 +80,11 @@ async def _local_model_slot(target_url: str, model: str, workload: Optional[str]
         })
         yield
     finally:
-        if kind == "foreground":
+        if kind == "foreground" and not acquired:
+            # Cancelled while still waiting for the lock — undo the waiting
+            # mark. (The acquired path already decremented above; a second
+            # unconditional decrement here used to eat a concurrently-waiting
+            # foreground caller's mark and let background work jump the queue.)
             _LOCAL_MODEL_WAITING_FOREGROUND = max(0, _LOCAL_MODEL_WAITING_FOREGROUND - 1)
         if acquired and _LOCAL_MODEL_LOCK.locked():
             owner = _LOCAL_MODEL_CURRENT.get("task")

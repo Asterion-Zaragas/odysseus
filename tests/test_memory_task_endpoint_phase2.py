@@ -155,6 +155,35 @@ async def test_workload_defaults_to_background(monkeypatch):
     assert captured.get("workload") == "background"
 
 
+@pytest.mark.asyncio
+async def test_interactive_workload_is_foreground(monkeypatch):
+    # interactive=True must clear BOTH foreground gates: skip
+    # wait_for_interactive_quiet AND go out as workload="foreground", or
+    # llm_core's _local_model_slot parks the call in its background
+    # wait-for-quiet loop — which self-deadlocks against the chat request
+    # the call runs inline in (the live facet-timeout bug, 2026-07-14).
+    captured = {}
+
+    async def fake_wait(label):
+        return False
+
+    async def fake_llm_call(candidates, messages, **kwargs):
+        captured.update(kwargs)
+        return "ok"
+
+    monkeypatch.setattr(
+        task_endpoint, "resolve_memory_candidates",
+        lambda *a, **k: [("http://llm", "model", {})],
+    )
+    monkeypatch.setattr(task_endpoint, "wait_for_interactive_quiet", fake_wait)
+    monkeypatch.setattr(task_endpoint, "llm_call_async_with_fallback", fake_llm_call)
+
+    await task_endpoint.memory_llm_call_async(
+        "fast", [{"role": "user", "content": "hi"}], interactive=True
+    )
+    assert captured.get("workload") == "foreground"
+
+
 # ── settings surface ──
 
 def test_default_settings_has_memory_role_and_scalar_keys():

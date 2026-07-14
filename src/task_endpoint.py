@@ -132,11 +132,15 @@ async def memory_llm_call_async(
 ):
     """Call the shared candidate chain for a memory-system agent role.
 
-    `interactive=True` skips the background-task foreground gate. Only the
-    retrieval hot path (Phase 6) should pass it: that call happens inline in
-    a chat turn, so it must not queue behind the same "UI is busy" window it
-    is itself part of. Every other memory role (tagger, curator, distiller)
-    runs off the interactive path and keeps the gate.
+    `interactive=True` marks a call that runs inline inside a foreground
+    request (retrieval facet/verify, manual curator run, inline tagging). It
+    must clear BOTH foreground gates or it deadlocks against the very request
+    it is part of: it skips `wait_for_interactive_quiet` here, AND it is sent
+    as `workload="foreground"` so llm_core's `_local_model_slot` doesn't park
+    it in the background wait-for-quiet loop (which checks the same
+    `has_foreground_activity()` signal — the caller's own request keeps that
+    True for the whole call). Background roles (nightly curator, extractor)
+    keep the gate and the yielding "background" workload.
 
     `fallback_url`/`fallback_model`/`fallback_headers` are appended as the
     last candidate — see `resolve_memory_candidates`.
@@ -149,5 +153,5 @@ async def memory_llm_call_async(
         raise RuntimeError(f"No LLM endpoint available for memory {role} task")
     if not interactive:
         await wait_for_interactive_quiet(f"memory {role} task")
-    kwargs.setdefault("workload", "background")
+    kwargs.setdefault("workload", "foreground" if interactive else "background")
     return await llm_call_async_with_fallback(candidates, messages=messages, **kwargs)
