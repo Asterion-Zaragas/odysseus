@@ -1611,6 +1611,10 @@
                 </select>
               </div>
               <div class="settings-row">
+                <label class="settings-label" title="Hard timeout (seconds) for the retrieval facet-extraction LLM call. Raise for slow local memory-fast models; on timeout retrieval still searches the full effort tier window, just without facet-guided tag narrowing.">Facet timeout (s)</label>
+                <input id="set-memoryFacetTimeout" type="text" inputmode="decimal" placeholder="2.0" class="settings-select" style="width:382.5px;flex:0 0 auto;margin-left:auto;">
+              </div>
+              <div class="settings-row">
                 <label class="settings-label">Inject context doc</label>
                 <span style="margin-left:auto;"><label class="admin-switch" title="Inject the memory context document (core facts summary) into chat by default"><input type="checkbox" id="set-memoryContextDocToggle"><span class="admin-slider"></span></label></span>
               </div>

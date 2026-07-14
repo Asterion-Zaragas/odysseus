@@ -179,6 +179,9 @@ DEFAULT_SETTINGS = {
     "memory_curator_batch": 25,
     # Default retrieval effort ("low" | "medium" | "high"); per-turn UI selector overrides it.
     "memory_retrieval_effort": "medium",
+    # Stage-A facet-extraction hard timeout in seconds. Raise for slow local
+    # memory-fast models (e.g. a cold 7B on a shared GPU) that can't answer in 2s.
+    "memory_facet_timeout": 2.0,
     # Whether the per-owner memory context document is injected into chat by default;
     # UI-toggled per turn like web search.
     "memory_context_doc_injection": False,

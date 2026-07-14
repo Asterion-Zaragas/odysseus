@@ -9,8 +9,11 @@ agent tool, so both get identical ranking behavior.
 Stages:
   A. facets (effort != low) — one *memory-fast* call turning the user
      message into ``{keywords, entities: [{type, name}], tag_guesses}``.
-     Hard 2s timeout; a timeout or parse failure silently degrades the
-     whole call to effort "low" (never blocks a chat turn on a slow model).
+     Hard timeout (``memory_facet_timeout`` setting, default 2s); a timeout
+     or parse failure marks the call ``facet_degraded`` — stage B then runs
+     without facet-guided tag narrowing, but still over the *requested*
+     effort's full tier window (a slow facet model must not silently shrink
+     the search space, and never blocks a chat turn).
   B. candidates (pure code) — tag filter (facet tag_guesses/entities
      intersected with each entry's tags; an empty intersection means no
      entry matched, so the filter is skipped rather than emptying the
@@ -18,12 +21,13 @@ Stages:
      hybrid scoring (ported from the pre-Phase-6
      ``ChatProcessor._hybrid_retrieve``) with a tier-weight multiplier and
      facet keywords folded into the query tokens.
-  C. verify (effort high only) — one *memory-fast* call over the top ~20
-     stage-B candidates that returns the ids of the truly relevant ones
-     (<=5, further capped to the caller's ``k``). A parse/call failure
-     falls back to the stage-B top-k; an explicit "none of these are
-     relevant" answer (valid empty list) is honored as-is, not treated as
-     a failure.
+  C. verify (effort high only, skipped when facet_degraded — the same
+     memory-fast model would very likely time out again) — one
+     *memory-fast* call over the top ~20 stage-B candidates that returns
+     the ids of the truly relevant ones (<=5, further capped to the
+     caller's ``k``). A parse/call failure falls back to the stage-B
+     top-k; an explicit "none of these are relevant" answer (valid empty
+     list) is honored as-is, not treated as a failure.
 """
 
 import asyncio
@@ -141,6 +145,12 @@ async def _extract_facets(message: str, owner: Optional[str], interactive: bool)
     try:
         from src.task_endpoint import memory_llm_call_async
 
+        try:
+            from src.settings import get_setting
+            timeout = float(get_setting("memory_facet_timeout", _FACET_TIMEOUT_SECONDS) or _FACET_TIMEOUT_SECONDS)
+        except Exception:
+            timeout = _FACET_TIMEOUT_SECONDS
+
         messages = [
             {"role": "system", "content": FACET_SYSTEM_PROMPT},
             {"role": "user", "content": message[:2000]},
@@ -150,7 +160,7 @@ async def _extract_facets(message: str, owner: Optional[str], interactive: bool)
                 "fast", messages, owner=owner, interactive=interactive,
                 temperature=0.1, max_tokens=300,
             ),
-            timeout=_FACET_TIMEOUT_SECONDS,
+            timeout=timeout,
         )
     except Exception as e:
         logger.debug("Memory facet extraction failed/timed out for owner=%r: %s", owner, e)
@@ -359,32 +369,39 @@ async def retrieve(
     chat preface excludes pinned/tier-0 entries it already injects
     unconditionally; the ``retrieve_memory_context`` tool passes everything).
 
-    Returns ``{"memories": [...], "facets": dict|None, "effort_used": str}``.
-    `effort_used` differs from the requested `effort` only when stage A
-    degraded low from a facet timeout/parse failure.
+    Returns ``{"memories": [...], "facets": dict|None, "effort_used": str,
+    "facet_degraded": bool}``. `effort_used` is always the (normalized)
+    requested effort — a stage-A facet timeout/parse failure sets
+    `facet_degraded` and loses the facet-guided tag narrowing (and, at high,
+    the verify pass), but never shrinks the effort's tier window.
     """
     effort = _normalize_effort(effort)
     message = (message or "").strip()
     if not message or not entries:
-        return {"memories": [], "facets": None, "effort_used": effort}
+        return {"memories": [], "facets": None, "effort_used": effort, "facet_degraded": False}
 
     facets = None
+    facet_degraded = False
     if effort != "low":
         facets = await _extract_facets(message, owner=owner, interactive=interactive)
-        if facets is None:
-            effort = "low"
+        facet_degraded = facets is None
 
     if effort == "high":
         ranked = _stage_b_rank(message, entries, effort, facets, memory_vector, pool_k=_VERIFY_POOL_SIZE)
-        top_pool = ranked[:_VERIFY_POOL_SIZE]
-        verified = await _verify(message, top_pool, owner=owner, interactive=interactive)
-        # Verify itself returns at most 5 (its own prompt-level cap on "how
-        # many are truly relevant"); this further caps to the caller's k so
-        # a k=3 chat-preface call doesn't inject 5 memories just because
-        # effort=high, same as the low/medium branch below already does.
-        memories = (verified if verified is not None else ranked)[:k]
+        if facet_degraded:
+            # The same memory-fast model that just missed the facet timeout
+            # would very likely miss verify too — skip it rather than stall
+            # another ~8s, and return the stage-B ranking as-is.
+            memories = ranked[:k]
+        else:
+            verified = await _verify(message, ranked[:_VERIFY_POOL_SIZE], owner=owner, interactive=interactive)
+            # Verify itself returns at most 5 (its own prompt-level cap on
+            # "how many are truly relevant"); this further caps to the
+            # caller's k so a k=3 chat-preface call doesn't inject 5 memories
+            # just because effort=high, same as the low/medium branch below.
+            memories = (verified if verified is not None else ranked)[:k]
     else:
         ranked = _stage_b_rank(message, entries, effort, facets, memory_vector, pool_k=k)
         memories = ranked[:k]
 
-    return {"memories": memories, "facets": facets, "effort_used": effort}
+    return {"memories": memories, "facets": facets, "effort_used": effort, "facet_degraded": facet_degraded}

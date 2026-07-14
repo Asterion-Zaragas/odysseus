@@ -464,7 +464,7 @@ FUNCTION_TOOL_SCHEMAS = [
                 "properties": {
                     "query": {"type": "string", "description": "What to look up in memory"},
                     "effort": {"type": "string", "enum": ["low", "medium", "high"],
-                               "description": "Search depth: low = no LLM calls, tiers 0-1 only; medium (default) = tag-filtered search over tiers 0-2; high = full store incl. archive, LLM-verified top picks. Higher effort costs more latency."}
+                               "description": "Search depth: low = no LLM calls, tiers 0-1 only; medium = tag-filtered search over tiers 0-2; high (default) = full store incl. archive, LLM-verified top picks. Higher effort costs more latency."}
                 },
                 "required": ["query"]
             }
@@ -1555,7 +1555,7 @@ def function_call_to_tool_block(name: str, arguments: str) -> Optional[ToolBlock
         else:
             content = action
     elif tool_type == "retrieve_memory_context":
-        content = json.dumps({"query": args.get("query", ""), "effort": args.get("effort") or "medium"})
+        content = json.dumps({"query": args.get("query", ""), "effort": args.get("effort") or "high"})
     elif tool_type == "list_models":
         content = args.get("filter", "")
     elif tool_type == "ui_control":

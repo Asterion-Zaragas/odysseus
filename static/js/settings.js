@@ -715,6 +715,7 @@ async function initMemorySystemSettings() {
   var curatorHourInput = el('set-memoryCuratorHour');
   var curatorBatchInput = el('set-memoryCuratorBatch');
   var effortSelect = el('set-memoryRetrievalEffort');
+  var facetTimeoutInput = el('set-memoryFacetTimeout');
   var contextDocToggle = el('set-memoryContextDocToggle');
   var expiryDaysInput = el('set-memoryExpiryDays');
   var protectedTagsInput = el('set-memoryProtectedTags');
@@ -730,6 +731,7 @@ async function initMemorySystemSettings() {
     if (settings.memory_curator_hour != null) curatorHourInput.value = settings.memory_curator_hour;
     if (settings.memory_curator_batch != null) curatorBatchInput.value = settings.memory_curator_batch;
     if (effortSelect && settings.memory_retrieval_effort) effortSelect.value = settings.memory_retrieval_effort;
+    if (facetTimeoutInput && settings.memory_facet_timeout != null) facetTimeoutInput.value = settings.memory_facet_timeout;
     if (contextDocToggle) contextDocToggle.checked = !!settings.memory_context_doc_injection;
     if (settings.memory_archive_expiry_days != null) expiryDaysInput.value = settings.memory_archive_expiry_days;
     if (settings.memory_protected_tags != null) protectedTagsInput.value = settings.memory_protected_tags;
@@ -745,6 +747,10 @@ async function initMemorySystemSettings() {
     var batch = parseInt(curatorBatchInput.value, 10);
     if (!isNaN(batch)) payload.memory_curator_batch = batch;
     if (effortSelect) payload.memory_retrieval_effort = effortSelect.value;
+    if (facetTimeoutInput) {
+      var facetTimeout = parseFloat(facetTimeoutInput.value);
+      if (!isNaN(facetTimeout) && facetTimeout > 0) payload.memory_facet_timeout = facetTimeout;
+    }
     if (contextDocToggle) payload.memory_context_doc_injection = contextDocToggle.checked;
     var expiry = parseInt(expiryDaysInput.value, 10);
     if (!isNaN(expiry)) payload.memory_archive_expiry_days = expiry;
@@ -759,7 +765,7 @@ async function initMemorySystemSettings() {
     } catch (e) { msg.textContent = 'Failed to save'; msg.style.color = 'var(--red)'; }
   }
 
-  [nightlyToggle, dryRunToggle, registryCapInput, curatorHourInput, curatorBatchInput, effortSelect, contextDocToggle, expiryDaysInput, protectedTagsInput]
+  [nightlyToggle, dryRunToggle, registryCapInput, curatorHourInput, curatorBatchInput, effortSelect, facetTimeoutInput, contextDocToggle, expiryDaysInput, protectedTagsInput]
     .forEach(function(input) { if (input) input.addEventListener('change', saveMemorySystem); });
 }
 

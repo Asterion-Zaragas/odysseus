@@ -660,6 +660,9 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
             "memory_curator_batch": (1, 200),
             "memory_archive_expiry_days": (1, 3650),
         }
+        _FLOAT_RANGES = {
+            "memory_facet_timeout": (0.5, 120.0),
+        }
         for key in DEFAULT_SETTINGS:
             if key not in body:
                 continue
@@ -671,6 +674,13 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
                 except (TypeError, ValueError):
                     raise HTTPException(400, f"{key} must be an integer")
                 val = max(lo, min(val, hi))
+            elif key in _FLOAT_RANGES:
+                flo, fhi = _FLOAT_RANGES[key]
+                try:
+                    val = float(val)
+                except (TypeError, ValueError):
+                    raise HTTPException(400, f"{key} must be a number")
+                val = max(flo, min(val, fhi))
             current[key] = val
         _save_settings(current)
         return current

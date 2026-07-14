@@ -54,11 +54,32 @@ async def test_extract_facets_degrades_on_timeout(monkeypatch):
         await asyncio.sleep(10)
         return "{}"
     monkeypatch.setattr("src.task_endpoint.memory_llm_call_async", slow_llm)
-    monkeypatch.setattr(retrieval, "_FACET_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr("src.settings.get_setting", lambda key, default=None: 0.05)
 
     facets = await retrieval._extract_facets("hello", owner=None, interactive=True)
 
     assert facets is None
+
+
+async def test_extract_facets_timeout_is_configurable(monkeypatch):
+    # A model too slow for the 2s default succeeds once memory_facet_timeout
+    # is raised — the escape hatch for slow local memory-fast models.
+    async def slowish_llm(role, messages, **kwargs):
+        await asyncio.sleep(0.1)
+        return json.dumps({"keywords": ["pizza"], "entities": [], "tag_guesses": []})
+    monkeypatch.setattr("src.task_endpoint.memory_llm_call_async", slowish_llm)
+
+    seen = {}
+
+    def fake_get_setting(key, default=None):
+        seen["key"] = key
+        return 5.0
+    monkeypatch.setattr("src.settings.get_setting", fake_get_setting)
+
+    facets = await retrieval._extract_facets("hello", owner=None, interactive=True)
+
+    assert seen["key"] == "memory_facet_timeout"
+    assert facets is not None and facets["keywords"] == ["pizza"]
 
 
 async def test_extract_facets_degrades_on_bad_json(monkeypatch):
@@ -198,15 +219,49 @@ async def test_retrieve_low_effort_never_calls_facets(monkeypatch):
     assert result["facets"] is None
 
 
-async def test_retrieve_medium_degrades_to_low_when_facets_fail(monkeypatch):
+async def test_retrieve_medium_keeps_tier_window_when_facets_fail(monkeypatch):
+    # A facet timeout/parse failure must NOT collapse the tier cap to low's
+    # tier <=1 — the requested effort keeps driving the eligible-tier window,
+    # only the facet-guided tag narrowing is lost. Regression test for the
+    # live bug where a slow memory-fast model made every tier-2 (situational/
+    # untriaged) memory unreachable.
     async def fake_extract(*a, **kw):
         return None
     monkeypatch.setattr(retrieval, "_extract_facets", fake_extract)
 
-    entries = [_entry("a", "sven likes pizza", tier=1)]
-    result = await retrieval.retrieve("sven pizza", entries, effort="medium")
+    entries = [_entry("hobby", "sven likes drawing and painting", tier=2)]
+    result = await retrieval.retrieve("sven drawing painting", entries, effort="medium")
 
-    assert result["effort_used"] == "low"
+    assert result["effort_used"] == "medium"
+    assert result["facet_degraded"] is True
+    assert [m["id"] for m in result["memories"]] == ["hobby"]
+
+
+async def test_retrieve_high_skips_verify_when_facets_degraded(monkeypatch):
+    # When the memory-fast model already missed the facet timeout, verify
+    # (same model, bigger prompt) would very likely stall too — retrieve()
+    # skips it and returns the stage-B ranking over the full high-effort
+    # tier window instead.
+    async def fake_extract(*a, **kw):
+        return None
+
+    verify_calls = []
+
+    async def fake_verify(message, candidates, owner, interactive):
+        verify_calls.append(candidates)
+        return candidates[:1]
+
+    monkeypatch.setattr(retrieval, "_extract_facets", fake_extract)
+    monkeypatch.setattr(retrieval, "_verify", fake_verify)
+
+    text = "sven really loves pizza with extra cheese every friday night"
+    entries = [_entry("situational", text, tier=2), _entry("archived", text, tier=3)]
+    result = await retrieval.retrieve(text, entries, effort="high")
+
+    assert verify_calls == []
+    assert result["effort_used"] == "high"
+    assert result["facet_degraded"] is True
+    assert {m["id"] for m in result["memories"]} == {"situational", "archived"}
 
 
 async def test_retrieve_high_effort_runs_verify_over_top_candidates(monkeypatch):
@@ -308,7 +363,7 @@ async def test_retrieve_normalizes_unknown_effort_to_medium(monkeypatch):
 
 async def test_retrieve_returns_empty_for_no_entries_or_blank_message():
     result = await retrieval.retrieve("", [_entry("a", "text")], effort="medium")
-    assert result == {"memories": [], "facets": None, "effort_used": "medium"}
+    assert result == {"memories": [], "facets": None, "effort_used": "medium", "facet_degraded": False}
 
     result2 = await retrieval.retrieve("hello", [], effort="medium")
     assert result2["memories"] == []
@@ -374,6 +429,46 @@ async def test_do_retrieve_memory_context_parses_json_args(ai_memory_manager, mo
     assert captured["message"] == "food preferences"
     assert captured["effort"] == "low"
     assert "No relevant memories" in result["results"]
+
+
+async def test_do_retrieve_memory_context_defaults_to_high_effort(ai_memory_manager, monkeypatch):
+    # An explicit, user-visible lookup defaults to the broadest tier window
+    # (high), not the chat preface's medium — both the fenced one-liner and
+    # the JSON shape without an effort field.
+    mm = ai_memory_manager
+    entry = mm.add_entry("Sven likes pizza", owner="alice")
+    with mm.lock:
+        mm.save([entry])
+
+    captured = {}
+
+    async def fake_retrieve(message, entries, *, effort, memory_vector, owner, k, interactive):
+        captured["effort"] = effort
+        return {"memories": [], "facets": None, "effort_used": effort}
+
+    monkeypatch.setattr("services.memory.retrieval.retrieve", fake_retrieve)
+
+    await ai.do_retrieve_memory_context("what does sven like", owner="alice")
+    assert captured["effort"] == "high"
+
+    await ai.do_retrieve_memory_context(json.dumps({"query": "food"}), owner="alice")
+    assert captured["effort"] == "high"
+
+
+async def test_do_retrieve_memory_context_notes_facet_degrade(ai_memory_manager, monkeypatch):
+    mm = ai_memory_manager
+    entry = mm.add_entry("Sven likes pizza", owner="alice")
+    with mm.lock:
+        mm.save([entry])
+
+    async def fake_retrieve(message, entries, *, effort, memory_vector, owner, k, interactive):
+        return {"memories": entries, "facets": None, "effort_used": effort, "facet_degraded": True}
+
+    monkeypatch.setattr("services.memory.retrieval.retrieve", fake_retrieve)
+
+    result = await ai.do_retrieve_memory_context("what does sven like", owner="alice")
+
+    assert "facets unavailable" in result["results"]
 
 
 async def test_do_retrieve_memory_context_requires_a_query(ai_memory_manager):

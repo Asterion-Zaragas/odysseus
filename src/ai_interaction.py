@@ -543,7 +543,10 @@ async def do_retrieve_memory_context(content: str, owner: Optional[str] = None) 
 
     Content format:
       Line 1: query
-      Line 2 (optional): effort (low|medium|high, default medium)
+      Line 2 (optional): effort (low|medium|high, default high — this is an
+      explicit, user-visible lookup, so it defaults to the broadest tier
+      window; the chat preface's inline injection stays at the
+      `memory_retrieval_effort` setting).
     Also accepts a JSON object ``{"query": "...", "effort": "..."}`` (the
     shape native function calls arrive in via tool_schemas.py).
     """
@@ -551,7 +554,7 @@ async def do_retrieve_memory_context(content: str, owner: Optional[str] = None) 
         return {"error": "Memory manager not available"}
 
     query = ""
-    effort = "medium"
+    effort = "high"
     parsed_json = None
     try:
         parsed_json = json.loads(content)
@@ -559,7 +562,7 @@ async def do_retrieve_memory_context(content: str, owner: Optional[str] = None) 
         pass
     if isinstance(parsed_json, dict):
         query = str(parsed_json.get("query") or "").strip()
-        effort = str(parsed_json.get("effort") or "medium").strip()
+        effort = str(parsed_json.get("effort") or "high").strip()
     else:
         lines = content.strip().split("\n")
         query = lines[0].strip() if lines else ""
@@ -582,6 +585,8 @@ async def do_retrieve_memory_context(content: str, owner: Optional[str] = None) 
     )
     memories = result["memories"]
     effort_used = result["effort_used"]
+    if result.get("facet_degraded"):
+        effort_used = f"{effort_used}, facets unavailable"
 
     if not memories:
         return {"results": f"No relevant memories found for '{query}' (effort={effort_used})."}
