@@ -1,15 +1,21 @@
-"""Preset routes — /api/presets GET, /api/presets/custom POST, user templates CRUD."""
+"""Preset routes — /api/presets GET, /api/presets/custom POST, user templates CRUD.
+
+All preset storage is owner-scoped: each authenticated user reads and writes
+their own presets/templates/groups (resolved via `effective_user`, so paired
+bearer-token clients act as their owning user). Auth itself is enforced by the
+app-level AuthMiddleware; these routes are deliberately NOT admin-gated —
+presets are per-user self-service, not shared app config.
+"""
 
 import asyncio
 import logging
 import uuid
 from typing import Dict, Any, List
 
-from fastapi import APIRouter, HTTPException, Request, Depends
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from src.request_models import PresetUpdateRequest
-from core.middleware import require_admin
 from src.auth_helpers import effective_user
 
 logger = logging.getLogger(__name__)
@@ -26,12 +32,17 @@ class UserTemplateRequest(BaseModel):
 def setup_preset_routes(preset_manager) -> APIRouter:
     router = APIRouter(tags=["presets"])
 
+    def _owner(request: Request):
+        # Normalize "" (single-user / anonymous modes) to None so the
+        # PresetManager takes its no-auth legacy path.
+        return effective_user(request) or None
+
     @router.get("/api/presets")
-    async def get_presets() -> Dict[str, Any]:
-        return preset_manager.presets
+    async def get_presets(request: Request) -> Dict[str, Any]:
+        return preset_manager.get_all(_owner(request))
 
     @router.post("/api/presets/custom")
-    async def update_custom_preset(preset_update: PresetUpdateRequest, _admin: None = Depends(require_admin)) -> Dict[str, Any]:
+    async def update_custom_preset(preset_update: PresetUpdateRequest, request: Request) -> Dict[str, Any]:
         try:
             success = preset_manager.update_custom(
                 preset_update.temperature,
@@ -41,6 +52,7 @@ def setup_preset_routes(preset_manager) -> APIRouter:
                 preset_update.enabled,
                 preset_update.inject_prefix,
                 preset_update.inject_suffix,
+                owner=_owner(request),
             )
             if success:
                 return {"success": True, "message": "Custom preset updated"}
@@ -50,22 +62,22 @@ def setup_preset_routes(preset_manager) -> APIRouter:
             raise HTTPException(500, "Failed to update custom preset")
 
     @router.get("/api/presets/templates")
-    async def get_user_templates() -> List[Dict]:
-        return preset_manager.get_user_templates()
+    async def get_user_templates(request: Request) -> List[Dict]:
+        return preset_manager.get_user_templates(_owner(request))
 
     @router.post("/api/presets/templates")
-    async def save_user_template(req: UserTemplateRequest, _admin: None = Depends(require_admin)) -> Dict[str, Any]:
+    async def save_user_template(req: UserTemplateRequest, request: Request) -> Dict[str, Any]:
         template = req.model_dump()
         if not template["id"]:
             template["id"] = f"user-{uuid.uuid4().hex[:8]}"
-        success = preset_manager.save_user_template(template)
+        success = preset_manager.save_user_template(template, owner=_owner(request))
         if success:
             return {"success": True, "template": template}
         return {"success": False, "message": "Failed to save template"}
 
     @router.delete("/api/presets/templates/{template_id}")
-    async def delete_user_template(template_id: str, _admin: None = Depends(require_admin)) -> Dict[str, Any]:
-        success = preset_manager.delete_user_template(template_id)
+    async def delete_user_template(template_id: str, request: Request) -> Dict[str, Any]:
+        success = preset_manager.delete_user_template(template_id, owner=_owner(request))
         if success:
             return {"success": True}
         return {"success": False, "message": "Failed to delete template"}
@@ -112,15 +124,15 @@ def setup_preset_routes(preset_manager) -> APIRouter:
 
     # ── Group presets ──
     @router.get("/api/presets/groups")
-    async def get_group_presets():
+    async def get_group_presets(request: Request):
         """Get saved group chat presets."""
-        return {"groups": preset_manager.get_group_presets()}
+        return {"groups": preset_manager.get_group_presets(_owner(request))}
 
     @router.post("/api/presets/groups")
-    async def save_group_presets(request: Request, _admin: None = Depends(require_admin)):
+    async def save_group_presets(request: Request):
         """Save group chat presets."""
         data = await request.json()
-        preset_manager.save_group_presets(data.get("groups", []))
+        preset_manager.save_group_presets(data.get("groups", []), owner=_owner(request))
         return {"ok": True}
 
     return router

@@ -2496,11 +2496,12 @@ def setup_model_routes(model_discovery):
             _user = _gcu(request) or ""
         except Exception:
             _user = ""
-        # Admins resolve via the global defaults (they own them, and the
-        # scoped resolution was making the picker disappear for them).
-        # Regular users get per-user prefs with NO global fallback for the
-        # model/endpoint values — that's what was leaking the previous
-        # admin's pick into every new account's composer.
+        # Every authenticated user resolves their per-user prefs first. Admins
+        # fall back to the global defaults (they own them, and admins with no
+        # personal pref would otherwise lose the picker). Regular users get NO
+        # global fallback for the model/endpoint values unless
+        # share_defaults_with_users is on — that's what was leaking the
+        # previous admin's pick into every new account's composer.
         settings = _load_settings()
         _is_admin = False
         try:
@@ -2509,16 +2510,16 @@ def setup_model_routes(model_discovery):
                 _is_admin = bool(auth_mgr.is_admin(_user))
         except Exception:
             _is_admin = False
-        if _user and not _is_admin:
+        if _user:
             from routes.prefs_routes import _load_for_user
             _user_prefs = _load_for_user(_user) or {}
             ep_id = (_user_prefs.get("default_endpoint_id") or "").strip()
             model = (_user_prefs.get("default_model") or "").strip()
             _fallbacks = _user_prefs.get("default_model_fallbacks") or []
-            # If user has no personal default, fall back to global default
-            # But only based on the "share_defaults_with_users" flag
-            # (only if share_defaults_with_users is enabled)
-            if settings.get("share_defaults_with_users", False):
+            # If the user has no personal default, fall back to the global
+            # default. Admins always do (they own the global settings); regular
+            # users only when "share_defaults_with_users" is enabled.
+            if _is_admin or settings.get("share_defaults_with_users", False):
                 if not ep_id:
                     ep_id = settings.get("default_endpoint_id", "")
                 if not model:

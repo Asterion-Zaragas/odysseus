@@ -82,7 +82,8 @@ def _make_request(user=None, auth_manager=None):
     )
 
 ### Shared test logic
-def _run_get_default_chat_test(monkeypatch, share_defaults_enabled, second_endpoint_only=False):
+def _run_get_default_chat_test(monkeypatch, share_defaults_enabled, second_endpoint_only=False,
+                               is_admin=False, user_prefs=None):
     """Helper function that runs get_default_chat with the given share_defaults_with_users setting."""
 
     global_settings = {
@@ -95,10 +96,16 @@ def _run_get_default_chat_test(monkeypatch, share_defaults_enabled, second_endpo
     }
 
     monkeypatch.setattr(model_routes, "_load_settings", lambda: global_settings)
-    monkeypatch.setattr(prefs_routes, "_load_for_user", lambda user: {})
+    # get_default_chat resolves prefs via a lazy `from routes.prefs_routes
+    # import _load_for_user` at call time; pin our module instance in
+    # sys.modules so the patch below is the one it sees (preserve_import_state
+    # may have restored a different instance).
+    import sys as _sys
+    monkeypatch.setitem(_sys.modules, "routes.prefs_routes", prefs_routes)
+    monkeypatch.setattr(prefs_routes, "_load_for_user", lambda user: dict(user_prefs or {}))
 
     fake_auth_manager = MagicMock()
-    fake_auth_manager.is_admin = lambda user: False
+    fake_auth_manager.is_admin = lambda user: is_admin
 
     endpoints = [
         _FakeEndpoint(
@@ -171,3 +178,32 @@ def test_get_default_chat_user_no_prefs_share_enabled_resolves_global_defaults(m
 
     assert test_data["endpoint_id"] == "fallback-ep", \
         "Should get global endpoint_id"
+
+
+def test_get_default_chat_admin_no_prefs_falls_back_to_global(monkeypatch):
+    """
+    An admin without personal preferences resolves the global defaults even
+    when share_defaults_with_users is disabled (admins own the global config).
+    """
+
+    test_data = _run_get_default_chat_test(monkeypatch, share_defaults_enabled=False, is_admin=True)
+
+    assert test_data["endpoint_id"] == "global-ep-123"
+    assert test_data["model"] == "qwen-3.6"
+
+
+def test_get_default_chat_admin_personal_prefs_win_over_global(monkeypatch):
+    """
+    An admin with per-user prefs gets their own default, not the global one —
+    the Settings "Default Chat Model" section now writes /api/prefs for every
+    account, admins included.
+    """
+
+    test_data = _run_get_default_chat_test(
+        monkeypatch, share_defaults_enabled=False, is_admin=True,
+        user_prefs={"default_endpoint_id": "global-ep-123", "default_model": "my-personal-model"},
+    )
+
+    assert test_data["endpoint_id"] == "global-ep-123"
+    assert test_data["model"] == "my-personal-model", \
+        "admin's per-user default_model must win over the global default"

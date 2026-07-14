@@ -24,8 +24,10 @@ def setup_backup_routes(memory_manager, preset_manager, skills_manager) -> APIRo
         # Memories (filtered by owner when auth is enabled)
         memories = memory_manager.load(owner=user)
 
-        # Presets (shared across users — export all)
-        presets = preset_manager.get_all()
+        # Presets — full raw store including the per-user `_users` map, so a
+        # restore round-trips every user's presets (get_all() would collapse
+        # them into one merged view).
+        presets = preset_manager.export_all()
 
         # Skills (filtered by owner when auth is enabled)
         skills = skills_manager.load(owner=user)
@@ -173,13 +175,9 @@ def setup_backup_routes(memory_manager, preset_manager, skills_manager) -> APIRo
 
         # ── Presets ──
         if "presets" in body and isinstance(body["presets"], dict):
-            current = preset_manager.get_all()
-            for key, value in body["presets"].items():
-                if isinstance(value, dict):
-                    current[key] = value
-                elif isinstance(value, list):
-                    current[key] = value
-            preset_manager.save(current)
+            # Multi-user backups merge slot-by-slot; legacy flat backups (old
+            # exports were one merged view) merge into the importer's slot.
+            preset_manager.import_all(body["presets"], owner=user)
             imported.append("presets")
 
         # ── Settings ──

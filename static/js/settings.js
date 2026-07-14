@@ -529,13 +529,31 @@ async function initDefaultChat() {
     });
   }
 
+  // The default chat model is a PER-USER preference (/api/prefs) so every
+  // account — admin or not — sets its own. The global settings.json value is
+  // only shown as the inherited baseline when the user has no pref yet.
   try {
-    var res = await fetch('/api/auth/settings', { credentials: 'same-origin' });
-    var settings = await res.json();
-    if (settings.default_endpoint_id) epSel.value = settings.default_endpoint_id;
-    refreshModels(settings.default_model || '');
-    _fallbacks = Array.isArray(settings.default_model_fallbacks)
-      ? settings.default_model_fallbacks.map(function(f) {
+    var epId = '', model = '', fallbacks = null;
+    try {
+      var pres = await fetch('/api/prefs', { credentials: 'same-origin' });
+      var prefs = await pres.json();
+      epId = prefs.default_endpoint_id || '';
+      model = prefs.default_model || '';
+      if (Array.isArray(prefs.default_model_fallbacks)) fallbacks = prefs.default_model_fallbacks;
+    } catch (e) { console.warn('Failed to load default chat prefs', e); }
+    if (!epId && !model) {
+      try {
+        var res = await fetch('/api/auth/settings', { credentials: 'same-origin' });
+        var settings = await res.json();
+        epId = settings.default_endpoint_id || '';
+        model = settings.default_model || '';
+        if (!fallbacks && Array.isArray(settings.default_model_fallbacks)) fallbacks = settings.default_model_fallbacks;
+      } catch (e) { /* no global baseline visible — leave empty */ }
+    }
+    if (epId) epSel.value = epId;
+    refreshModels(model || '');
+    _fallbacks = Array.isArray(fallbacks)
+      ? fallbacks.map(function(f) {
           return { endpoint_id: (f && f.endpoint_id) || '', model: (f && f.model) || '' };
         })
       : [];
@@ -548,14 +566,17 @@ async function initDefaultChat() {
   async function saveDefault() {
     try {
       var clean = _fallbacks.filter(function(f) { return f.endpoint_id && f.model; });
-      await fetch('/api/auth/settings', { method: 'POST', credentials: 'same-origin',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          default_endpoint_id: epSel.value,
-          default_model: modelSel.value,
-          default_model_fallbacks: clean
-        })
-      });
+      // Sequential PUTs — /api/prefs/{key} does a read-modify-write of the
+      // whole prefs slot, so parallel writes could drop keys.
+      var putPref = function(key, value) {
+        return fetch('/api/prefs/' + key, { method: 'PUT', credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ value: value })
+        });
+      };
+      await putPref('default_endpoint_id', epSel.value);
+      await putPref('default_model', modelSel.value);
+      await putPref('default_model_fallbacks', clean);
       msg.textContent = 'Saved'; msg.style.color = 'var(--fg)';
       setTimeout(function() { msg.textContent = ''; }, 2000);
     } catch (e) { msg.textContent = 'Failed to save'; msg.style.color = 'var(--red)'; }

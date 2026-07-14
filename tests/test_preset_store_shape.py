@@ -8,5 +8,5 @@ def test_non_object_preset_store_falls_back_to_defaults(tmp_path):
 
     manager = PresetManager(str(tmp_path))
 
-    assert manager.presets == PresetManager.DEFAULT_PRESETS
+    assert manager.get_all() == PresetManager.DEFAULT_PRESETS
     assert manager.get("custom")["enabled"] is False

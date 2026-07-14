@@ -1,12 +1,13 @@
-"""An older / partial presets.json must be healed forward on load: built-in
-presets that are missing get filled in, WITHOUT clobbering user edits.
+"""An older / partial presets.json must still serve every built-in preset,
+WITHOUT clobbering user edits.
 
-This extends the adjacent legacy `custom`-shape migration in
-`PresetManager.load`, which already repairs forward-incompatible files and
-re-saves them. A missing built-in is never an intentional user action — there
-is no delete path for the built-in keys (only `user_templates` entries can be
-deleted), and presets are hidden via an `enabled: False` flag, not removal — so
-filling them back in is safe.
+Built-ins are no longer persisted per store — `PresetManager.get_all()` merges
+`DEFAULT_PRESETS` in at read time (defaults first, stored values win), so a
+missing built-in can never be absent from the picker served by
+GET /api/presets. A missing built-in is never an intentional user action —
+there is no delete path for the built-in keys (only `user_templates` entries
+can be deleted), and presets are hidden via an `enabled: False` flag, not
+removal — so serving them back is safe.
 """
 import json
 import os
@@ -22,7 +23,7 @@ def _write_presets(data: dict) -> str:
     return d
 
 
-def test_missing_builtin_presets_are_filled_in():
+def test_missing_builtin_presets_are_served():
     # Partial file: has code_analyze + brainstorm, missing reason + custom.
     data_dir = _write_presets({
         "code_analyze": {"name": "Code Analyze", "temperature": 0.2,
@@ -31,15 +32,14 @@ def test_missing_builtin_presets_are_filled_in():
                        "max_tokens": 4096, "system_prompt": "ideate"},
     })
     pm = PresetManager(data_dir)
+    merged = pm.get_all()
     for key in PresetManager.DEFAULT_PRESETS:
-        assert key in pm.presets, f"built-in preset {key!r} should be present"
-    # The fill is persisted so the next load is already complete.
-    with open(os.path.join(data_dir, "presets.json"), encoding="utf-8") as f:
-        on_disk = json.load(f)
-    assert "reason" in on_disk and "custom" in on_disk
+        assert key in merged, f"built-in preset {key!r} should be present"
+    # Stored (possibly edited) values win over the defaults.
+    assert merged["code_analyze"]["system_prompt"] == "analyze"
 
 
-def test_fill_does_not_clobber_user_edits():
+def test_merge_does_not_clobber_user_edits():
     # An edited `custom` (enabled, bespoke prompt) plus a missing `reason`.
     edited_custom = {
         "name": "My Persona",
@@ -61,18 +61,23 @@ def test_fill_does_not_clobber_user_edits():
         # missing: reason
     })
     pm = PresetManager(data_dir)
-    # reason was filled...
-    assert "reason" in pm.presets
+    merged = pm.get_all()
+    # reason is served...
+    assert "reason" in merged
     # ...but the user's edited custom + templates are untouched.
-    assert pm.presets["custom"] == edited_custom
-    assert pm.presets["user_templates"] == [{"id": "t1", "name": "Tmpl"}]
+    assert merged["custom"] == edited_custom
+    assert merged["user_templates"] == [{"id": "t1", "name": "Tmpl"}]
+    assert pm.get_user_templates() == [{"id": "t1", "name": "Tmpl"}]
 
 
-def test_complete_file_is_not_rewritten_needlessly():
-    # A file that already has every built-in must be returned unchanged.
-    full = {k: dict(v) for k, v in PresetManager.DEFAULT_PRESETS.items()}
-    full["custom"]["enabled"] = True  # a user edit that must survive
-    data_dir = _write_presets(full)
+def test_partial_file_is_not_rewritten():
+    # The read-time merge must not rewrite the file (writes only happen on
+    # explicit user saves, which then land in that user's slot).
+    data = {"code_analyze": {"name": "Code Analyze", "temperature": 0.2,
+                             "max_tokens": 8000, "system_prompt": "analyze"}}
+    data_dir = _write_presets(data)
     pm = PresetManager(data_dir)
-    assert pm.presets["custom"]["enabled"] is True
-    assert set(PresetManager.DEFAULT_PRESETS) <= set(pm.presets)
+    pm.get_all()
+    with open(os.path.join(data_dir, "presets.json"), encoding="utf-8") as f:
+        on_disk = json.load(f)
+    assert on_disk == data

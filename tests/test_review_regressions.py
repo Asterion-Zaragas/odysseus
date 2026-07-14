@@ -90,6 +90,8 @@ def _install_model_route_import_stubs(monkeypatch):
     exceptions_mod.SessionNotFoundError = type("SessionNotFoundError", (Exception,), {})
     session_mgr_mod = types.ModuleType("core.session_manager")
     session_mgr_mod.SessionManager = MagicMock()
+    log_safety_mod = types.ModuleType("core.log_safety")
+    log_safety_mod.redact_url = lambda url: url
 
     monkeypatch.delitem(sys.modules, "routes.model_routes", raising=False)
     monkeypatch.delitem(sys.modules, "routes.chat_routes", raising=False)
@@ -101,6 +103,7 @@ def _install_model_route_import_stubs(monkeypatch):
     monkeypatch.setitem(sys.modules, "core.models", models_mod)
     monkeypatch.setitem(sys.modules, "core.exceptions", exceptions_mod)
     monkeypatch.setitem(sys.modules, "core.session_manager", session_mgr_mod)
+    monkeypatch.setitem(sys.modules, "core.log_safety", log_safety_mod)
 
 
 def _install_core_auth_stub(monkeypatch):
@@ -262,18 +265,18 @@ def test_preset_manager_persists_inject_fields(tmp_path):
     )
 
     assert ok is True
-    assert manager.presets["custom"]["inject_prefix"] == "PREFIX"
-    assert manager.presets["custom"]["inject_suffix"] == "SUFFIX"
+    assert manager.get("custom")["inject_prefix"] == "PREFIX"
+    assert manager.get("custom")["inject_suffix"] == "SUFFIX"
 
     reloaded = PresetManager(str(tmp_path))
-    assert reloaded.presets["custom"]["inject_prefix"] == "PREFIX"
-    assert reloaded.presets["custom"]["inject_suffix"] == "SUFFIX"
+    assert reloaded.get("custom")["inject_prefix"] == "PREFIX"
+    assert reloaded.get("custom")["inject_suffix"] == "SUFFIX"
 
 
 def test_preset_manager_default_custom_preset_starts_disabled(tmp_path):
     manager = PresetManager(str(tmp_path))
 
-    custom = manager.presets["custom"]
+    custom = manager.get("custom")
 
     assert custom["enabled"] is False
     assert custom["system_prompt"] == ""
@@ -296,7 +299,7 @@ def test_preset_manager_migrates_legacy_default_custom_preset_disabled(tmp_path)
     )
 
     manager = PresetManager(str(tmp_path))
-    custom = manager.presets["custom"]
+    custom = manager.get("custom")
 
     assert custom["enabled"] is False
     assert custom["system_prompt"] == ""
@@ -368,7 +371,7 @@ async def test_build_chat_context_incognito_does_not_duplicate_current_user_mess
             attachment_meta=[],
         )
 
-    def fake_extract_preset(chat_handler, preset_id):
+    def fake_extract_preset(chat_handler, preset_id, owner=None):
         return chat_helpers.PresetInfo(
             temperature=0.7,
             max_tokens=1024,

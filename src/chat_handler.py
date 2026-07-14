@@ -80,9 +80,16 @@ class ChatHandler:
     # Preset helpers
     # ------------------------------------------------------------------
 
-    def validate_and_extract_preset(self, preset_id: Optional[str]) -> tuple:
-        """Returns (temperature, max_tokens, preset_system_prompt, character_name)."""
-        if preset_id and preset_id not in self.preset_manager.presets:
+    def validate_and_extract_preset(
+        self, preset_id: Optional[str], owner: Optional[str] = None
+    ) -> tuple:
+        """Returns (temperature, max_tokens, preset_system_prompt, character_name).
+
+        Presets are owner-scoped: `owner` (the session owner) resolves the
+        preset from that user's store, so each account gets its own persona.
+        """
+        preset = self.preset_manager.get(preset_id, owner) if preset_id else None
+        if preset_id and preset is None:
             raise HTTPException(400, f"Invalid preset_id: {preset_id}")
 
         temperature = DEFAULT_TEMPERATURE
@@ -90,8 +97,7 @@ class ChatHandler:
         preset_system_prompt = None
         character_name = ""
 
-        if preset_id and preset_id in self.preset_manager.presets:
-            preset = self.preset_manager.presets[preset_id]
+        if preset is not None:
             if preset.get("enabled") is False:
                 logger.info(f"Preset {preset_id} is disabled, using defaults")
                 return temperature, max_tokens, preset_system_prompt, character_name
