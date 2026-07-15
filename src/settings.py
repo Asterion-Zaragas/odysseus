@@ -179,6 +179,10 @@ DEFAULT_SETTINGS = {
     "memory_curator_batch": 25,
     # Default retrieval effort ("low" | "medium" | "high"); per-turn UI selector overrides it.
     "memory_retrieval_effort": "medium",
+    # Max searched memories injected into the chat preface per turn (1-5).
+    # Pinned/core memories always inject on top of this cap; the
+    # retrieve_memory_context tool's k is independent.
+    "memory_recall_k": 3,
     # Stage-A facet-extraction hard timeout in seconds. Raise for slow local
     # memory-fast models (e.g. a cold 7B on a shared GPU) that can't answer in 2s.
     "memory_facet_timeout": 2.0,

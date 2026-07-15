@@ -118,6 +118,28 @@ async def test_rest_entries_flow_through_staged_retrieve(monkeypatch):
     assert kinds["Recallable situational memory"] == "recalled"
 
 
+async def test_preface_recall_k_honors_memory_recall_k_setting(monkeypatch):
+    settings = {"memory_recall_k": 2}
+    monkeypatch.setattr("src.settings.get_setting", lambda key, default=None: settings.get(key, default))
+    captured = {}
+
+    async def fake_retrieve(message, entries, *, effort, memory_vector, owner, k, interactive):
+        captured["k"] = k
+        return {"memories": [], "facets": None, "effort_used": effort}
+
+    monkeypatch.setattr("src.chat_processor.memory_retrieve", fake_retrieve)
+
+    mm = _FakeMemoryManager([_entry("r", "Recallable situational memory", tier=2)])
+    processor = ChatProcessor(memory_manager=mm, personal_docs_manager=SimpleNamespace(rag_manager=None))
+
+    await processor.build_context_preface(
+        message="q", session=_session(), use_web=False, use_rag=False, use_skills=False,
+        memory_effort="low",
+    )
+
+    assert captured["k"] == 2
+
+
 async def test_effort_and_doc_toggle_default_from_settings_when_omitted(monkeypatch):
     settings = {"memory_retrieval_effort": "high", "memory_context_doc_injection": True}
     monkeypatch.setattr("src.settings.get_setting", lambda key, default=None: settings.get(key, default))

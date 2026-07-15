@@ -229,9 +229,10 @@ class ChatProcessor:
                         _used_ids.append(m["id"])
 
             if rest:
+                recall_k = int(get_setting("memory_recall_k", 3) or 3)
                 result = await memory_retrieve(
                     message, rest, effort=memory_effort, memory_vector=self.memory_vector,
-                    owner=owner, k=3, interactive=True,
+                    owner=owner, k=recall_k, interactive=True,
                 )
                 relevant = result["memories"]
                 if relevant:
