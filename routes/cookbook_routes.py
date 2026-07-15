@@ -1787,6 +1787,36 @@ def setup_cookbook_routes() -> APIRouter:
             if remote_home:
                 mlx_shim_model_id = f"{remote_home}/.cache/odysseus/mlx-shims/{short_name}"
 
+        from routes.model_routes import _model_ids_equivalent, _reconcile_cookbook_model_ids
+
+        friendly = (req.friendly_name or "").strip()
+
+        def _apply_friendly_label(ep_row) -> None:
+            """Merge this launch's cosmetic label into ep.model_labels.
+
+            Keyed by the launch-intent id (repo_id, or the MLX shim id), so
+            the label is visible on the pinned row before the server has
+            answered /v1/models; reconciliation migrates it to the probed
+            wire id later. Also refresh any EXISTING key equivalent to this
+            repo_id (a previous launch's already-migrated wire id) — without
+            this, relaunching with a new name would lose to reconciliation's
+            never-overwrite rule and keep showing the old name.
+            """
+            if not friendly:
+                return
+            try:
+                labels = json.loads(ep_row.model_labels or "{}")
+            except Exception:
+                labels = {}
+            if not isinstance(labels, dict):
+                labels = {}
+            for k in list(labels.keys()):
+                if _model_ids_equivalent(k, req.repo_id):
+                    labels[k] = friendly
+            for key in ([mlx_shim_model_id] if mlx_shim_model_id else ([req.repo_id] if req.repo_id else [])):
+                labels[key] = friendly
+            ep_row.model_labels = json.dumps(labels)
+
         # If the serve command opts models into OpenAI tool-calling, record it so
         # agent_loop trusts emitted tool_calls instead of the name heuristic.
         is_ollama_endpoint = "ollama" in (req.cmd or "").lower()
@@ -1824,6 +1854,7 @@ def setup_cookbook_routes() -> APIRouter:
                         existing.cached_models = json.dumps(pinned_models)
                 if supports_tools is not None:
                     existing.supports_tools = supports_tools
+                _apply_friendly_label(existing)
                 db.commit()
                 logger.info(f"Updated existing local model endpoint: {base_url}")
                 # Re-probe so cached_models matches what the server actually
@@ -1840,6 +1871,7 @@ def setup_cookbook_routes() -> APIRouter:
                         probed = _probe_endpoint(base_url, existing.api_key, timeout=5)
                         if probed:
                             existing.cached_models = _json2.dumps(probed)
+                            _reconcile_cookbook_model_ids(existing, probed)
                             db.commit()
                 except Exception as _pe:
                     logger.warning(f"Re-probe failed for {base_url}: {_pe!r}")
@@ -1875,6 +1907,7 @@ def setup_cookbook_routes() -> APIRouter:
                 pinned_models=json.dumps(pinned_models) if pinned_models else None,
                 supports_tools=supports_tools,
             )
+            _apply_friendly_label(ep)
             db.add(ep)
             db.commit()
             logger.info(f"Auto-registered local model endpoint: {display_name} @ {base_url}")
@@ -1908,6 +1941,7 @@ def setup_cookbook_routes() -> APIRouter:
                     probed = _probe_endpoint(base_url, None, timeout=5)
                     if probed:
                         ep.cached_models = _json2.dumps(probed)
+                        _reconcile_cookbook_model_ids(ep, probed)
                         db.commit()
                         logger.info(f"Auto-register: probed {len(probed)} models @ {base_url}")
             except Exception as _pe:

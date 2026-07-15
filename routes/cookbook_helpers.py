@@ -1085,6 +1085,7 @@ class ServeRequest(BaseModel):
     hf_token: str | None = None
     gpus: str | None = None
     platform: str | None = None    # "linux", "termux", or "windows"
+    friendly_name: str | None = None  # cosmetic model label for the auto-registered endpoint
 
 
 def _parse_serve_phase(snapshot: str, task_type: str = "serve") -> dict:

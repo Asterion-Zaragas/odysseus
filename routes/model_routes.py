@@ -1302,6 +1302,107 @@ def _merge_model_ids(*lists):
     return out
 
 
+_MODEL_ID_SPLIT_SUFFIX_RE = re.compile(r"-\d+-of-\d+$")
+
+
+def _normalize_model_id_key(mid: str) -> str:
+    """Canonical form for fuzzy model-id comparison.
+
+    Cookbook launches, pinned launch intents, and /v1/models probes can each
+    name the SAME model differently (local dir name `Gemma_4_31B`, dir path,
+    GGUF file path `.../Gemma-4-31B.gguf`). Reduce all of them to a
+    comparable stem: last path segment, multi-part split suffix
+    (-00001-of-00002) and .gguf extension stripped, lowercased, separator
+    characters removed.
+    """
+    s = str(mid or "").strip().rstrip("/").split("/")[-1]
+    s = s.split("\\")[-1]
+    if s.lower().endswith(".gguf"):
+        s = s[:-5]
+    s = _MODEL_ID_SPLIT_SUFFIX_RE.sub("", s)
+    return re.sub(r"[-_.\s]+", "", s.lower())
+
+
+def _model_ids_equivalent(a: str, b: str) -> bool:
+    """Whether two model ids plausibly refer to the same model.
+
+    Python mirror of _modelIdMatchesExpected (static/js/cookbookRunning.js):
+    normalized stems are equal or one contains the other. Empty stems never
+    match.
+    """
+    na, nb = _normalize_model_id_key(a), _normalize_model_id_key(b)
+    if not na or not nb:
+        return False
+    return na == nb or na in nb or nb in na
+
+
+def _is_cookbook_managed_endpoint(ep) -> bool:
+    """Endpoints created/adopted by Cookbook serves.
+
+    Checks the RAW endpoint_kind column: Cookbook writes "local" or "ollama"
+    there, and "ollama" is not in _ENDPOINT_KINDS so _endpoint_kind() would
+    normalize it to "auto". The id prefix covers rows whose kind was edited.
+    """
+    raw_kind = str(getattr(ep, "endpoint_kind", "") or "").strip().lower()
+    if raw_kind in ("local", "ollama"):
+        return True
+    return str(getattr(ep, "id", "") or "").startswith("local-")
+
+
+def _reconcile_cookbook_model_ids(ep, probed_ids) -> bool:
+    """Migrate provisional model ids onto real probed ids.
+
+    Cookbook pins the launch-intent id (repo/dir name) and keys the friendly
+    name under it before the server's wire-level id is known; llama.cpp then
+    reports the GGUF file path from /v1/models, leaving a duplicate pinned row
+    and an orphaned label. Whenever fresh probed ids are persisted, rewrite
+    pinned ids and model_labels keys that fuzzy-match a probed id to that
+    probed id. Only touches Cookbook-managed endpoints; never renames or
+    drops probed ids; never overwrites a label already set on the probed id
+    (the provisional key is dropped). Returns True if ep changed — the
+    caller commits.
+    """
+    probed = _normalize_model_ids(probed_ids)
+    if not probed or not _is_cookbook_managed_endpoint(ep):
+        return False
+    probed_set = set(probed)
+
+    def _match(mid):
+        for pid in probed:
+            if _model_ids_equivalent(mid, pid):
+                return pid
+        return None
+
+    changed = False
+    pinned = _normalize_model_ids(getattr(ep, "pinned_models", None))
+    if pinned:
+        new_pinned = []
+        for mid in pinned:
+            target = mid if mid in probed_set else (_match(mid) or mid)
+            if target not in new_pinned:
+                new_pinned.append(target)
+        if new_pinned != pinned:
+            ep.pinned_models = json.dumps(new_pinned) if new_pinned else None
+            changed = True
+
+    labels = _model_labels_dict(ep)
+    if labels:
+        new_labels = dict(labels)
+        for key, label in labels.items():
+            if key in probed_set:
+                continue
+            target = _match(key)
+            if not target:
+                continue
+            if target not in new_labels:
+                new_labels[target] = label
+            del new_labels[key]
+        if new_labels != labels:
+            ep.model_labels = json.dumps(new_labels) if new_labels else None
+            changed = True
+    return changed
+
+
 def _is_mlx_deepseek_v4_repo_id(model_id: str) -> bool:
     m = str(model_id or "").lower()
     return "mlx-community/deepseek-v4" in m
@@ -1550,6 +1651,7 @@ def setup_model_routes(model_discovery):
                                         ep_obj = db.query(ModelEndpoint).filter(ModelEndpoint.id == ep_id).first()
                                         if ep_obj:
                                             ep_obj.cached_models = json.dumps(ids)
+                                            _reconcile_cookbook_model_ids(ep_obj, ids)
                                             changed = True
                                     st["last_success"] = _time.time()
                                     st["fail_count"] = 0
@@ -1922,6 +2024,7 @@ def setup_model_routes(model_discovery):
                         ep_obj = db2.query(ModelEndpoint).filter(ModelEndpoint.id == ep["id"]).first()
                         if ep_obj:
                             ep_obj.cached_models = json.dumps(all_models)
+                            _reconcile_cookbook_model_ids(ep_obj, all_models)
                             db2.commit()
                     finally:
                         db2.close()
@@ -2158,6 +2261,7 @@ def setup_model_routes(model_discovery):
                     )
                     if probed_models:
                         existing.cached_models = json.dumps(probed_models)
+                        _reconcile_cookbook_model_ids(existing, probed_models)
                         changed = True
                 if changed:
                     _db_dedup.commit()
@@ -2347,6 +2451,7 @@ def setup_model_routes(model_discovery):
                     ep_obj.hidden_models = json.dumps(failed) if failed else None
                     if all_models:
                         ep_obj.cached_models = json.dumps(all_models)
+                        _reconcile_cookbook_model_ids(ep_obj, all_models)
                     db2.commit()
             finally:
                 db2.close()
@@ -2387,6 +2492,9 @@ def setup_model_routes(model_discovery):
                 if probed:
                     all_models = probed
                     ep.cached_models = json.dumps(all_models)
+                    # Reconcile BEFORE reading pinned/labels below, so the
+                    # response already reflects the migrated ids.
+                    _reconcile_cookbook_model_ids(ep, probed)
                     db.commit()
                     _invalidate_models_cache()
                     response.headers["X-Model-Refresh-Status"] = "refreshed"

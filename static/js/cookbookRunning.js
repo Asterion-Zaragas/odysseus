@@ -646,8 +646,30 @@ function _markServeEndpointMismatch(task, ep, host, port) {
   uiModule.showError(msg);
 }
 
+// The model id we REGISTER under (pin + friendly-name key) before the
+// server's real wire id is known. served_model_name (vLLM) IS the wire id;
+// model_path is the wire id for vLLM/SGLang path-serves but NOT for
+// llama.cpp — there the -m gguf file is resolved server-side and /v1/models
+// reports the file path, so llama.cpp falls through to repo_id, matching
+// what the backend pins (_auto_register_llm_endpoint). The backend's
+// reconciliation pass migrates these provisional ids onto the probed wire
+// id once /v1/models answers. Contrast _serveExpectedModel, which feeds
+// fuzzy MISMATCH detection and deliberately keeps model_path in the chain.
+function _serveIntentModelId(task) {
+  const fields = task?.payload?._fields || {};
+  const backend = String(fields.backend || '');
+  return String(
+    fields.served_model_name
+    || (backend !== 'llamacpp' ? fields.model_path : '')
+    || task?.payload?.repo_id
+    || task?.model
+    || task?.name
+    || ''
+  ).trim();
+}
+
 function _appendPinnedServeModel(fd, task) {
-  const expected = _serveExpectedModel(task);
+  const expected = _serveIntentModelId(task);
   if (expected) fd.append('pinned_models', expected);
 }
 
@@ -661,7 +683,7 @@ function _isImageServeTask(task) {
 function _friendlyLabelFor(task) {
   const name = String(task?.payload?._fields?.friendly_name || '').trim();
   if (!name) return null;
-  const modelId = _serveExpectedModel(task);
+  const modelId = _serveIntentModelId(task);
   if (!modelId) return null;
   return { modelId, name };
 }
@@ -2030,6 +2052,10 @@ export async function _launchServeTask(shortName, repo, cmd, fields, hostOverrid
     hf_token: _envState.hfToken || undefined,
     gpus: _usedGpus || undefined,
     platform: _hplatform || undefined,
+    // Cosmetic label from the serve panel — lets the backend attach it to
+    // the auto-registered endpoint at serve time, so it's visible even
+    // before the frontend's own label PATCH runs.
+    friendly_name: String(fields?.friendly_name || '').trim() || undefined,
   };
 
   try {
