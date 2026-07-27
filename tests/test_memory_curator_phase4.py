@@ -6,6 +6,7 @@ round-trip, checkpoint resumability, and the full `curate()` pipeline
 end-to-end against mocked "memory smart" LLM calls.
 """
 
+import json
 import tempfile
 import time
 
@@ -13,6 +14,13 @@ import pytest
 
 from services.memory import memory_curator as cur
 from src.memory import MemoryManager
+
+
+def _payload(messages):
+    """Parse the JSON payload out of a curator user turn. `_user_message` now
+    appends a trailing 'return only JSON' reminder after a blank line, so the
+    content is `<single-line-json>\\n\\n<reminder>` — split it back off."""
+    return json.loads(messages[-1]["content"].split("\n\n")[0])
 
 
 # ── cluster_batches ──
@@ -207,7 +215,7 @@ async def test_curate_full_pipeline_runs_all_passes(_isolated_dirs, monkeypatch)
             if "from" in messages[0]["content"] and "into" in messages[0]["content"]:
                 return "[]"
             if "duplicate" in messages[0]["content"].lower() or "MERGE" in messages[0]["content"]:
-                return f'[{{"id": "{e1["id"]}", "text": "User likes tea", "tags": ["drinks"]}}]'
+                return '{"merges": [], "remove": []}'  # single entry: nothing to merge
             return "[]"
 
         monkeypatch.setattr("src.task_endpoint.memory_llm_call_async", fake_llm)
@@ -258,9 +266,7 @@ async def test_curate_threads_interactive_flag_to_smart_calls(_isolated_dirs, mo
                 if '"from"' in sys and '"into"' in sys:  # tag-merge
                     return "[]"
                 if "duplicate" in sys.lower() or "MERGE" in sys:  # dedupe: keep both
-                    return json.dumps(
-                        [{"id": e["id"], "text": e["text"], "tags": e.get("tags", [])} for e in (e1, e2)]
-                    )
+                    return json.dumps({"merges": [], "remove": []})
                 return "[]"                          # context-facts summary etc.
 
             monkeypatch.setattr("src.task_endpoint.memory_llm_call_async", fake_llm)
@@ -328,12 +334,11 @@ async def test_curate_dedupe_unsafe_removal_refused(_isolated_dirs, monkeypatch)
         mgr.save(entries)
 
         async def fake_llm(role, messages, owner=None, **kwargs):
-            # Dedupe pass returns only 2 of 10 -> over 50% cut, must be refused.
+            # Dedupe asks to remove all but one of 10 -> over 50% cut, must be refused.
             if role == "smart" and isinstance(messages[-1]["content"], str) and "fact 0" in messages[-1]["content"]:
-                import json as _json
-                payload = _json.loads(messages[-1]["content"])
+                payload = _payload(messages)
                 if len(payload) >= 8:
-                    return _json.dumps([{"id": payload[0]["id"], "text": payload[0]["text"], "tags": []}])
+                    return json.dumps({"merges": [], "remove": [e["id"] for e in payload[1:]]})
             return "[]"
 
         monkeypatch.setattr("src.task_endpoint.memory_llm_call_async", fake_llm)
@@ -474,9 +479,7 @@ async def test_curate_force_bypasses_tidy_fingerprint(_isolated_dirs, monkeypatc
             sys = messages[0]["content"]
             if "duplicate" in sys.lower() or "MERGE" in sys:
                 # Keep both entries unchanged (valid JSON, no removal).
-                import json as _json
-                payload = _json.loads(messages[-1]["content"])
-                return _json.dumps(payload)
+                return json.dumps({"merges": [], "remove": []})
             return "[]"
 
         monkeypatch.setattr("src.task_endpoint.memory_llm_call_async", fake_llm)
@@ -627,13 +630,12 @@ async def test_curate_triage_bisection_isolates_poison_entry_in_shared_batch(_is
         async def fake_llm(role, messages, owner=None, **kwargs):
             sys = messages[0]["content"]
             if "promote_tags" in sys:  # triage
-                payload = json.loads(messages[-1]["content"])
+                payload = _payload(messages)
                 if any(item["id"] == poison["id"] for item in payload):
                     return "the model rambles instead of returning JSON"
                 return json.dumps([{"id": item["id"], "generality": 2, "promote_tags": []} for item in payload])
             if "duplicate" in sys.lower() or "MERGE" in sys:  # dedupe: keep everything unchanged
-                payload = json.loads(messages[-1]["content"])
-                return json.dumps(payload)
+                return json.dumps({"merges": [], "remove": []})
             return "[]"  # tag-merge / context-facts summary
 
         monkeypatch.setattr("src.task_endpoint.memory_llm_call_async", fake_llm)
@@ -710,3 +712,85 @@ async def test_quarantine_dry_run_previews_without_persisting(_isolated_dirs, mo
         assert cur.list_quarantined("alice") == []  # dry runs never persist quarantine state
         log = cur.read_curation_log("alice", include_dry_run=True)
         assert any(rec["action"] == "quarantine" and rec["dry_run"] for rec in log)
+
+
+# ── JSON-mode dedupe: instruction-shaped merge/remove ──
+
+async def test_curate_dedupe_applies_merges_and_removes(_isolated_dirs, monkeypatch):
+    """New instruction-shaped dedupe: the model reports merge/remove by id (it
+    never rewrites text). The curator drops merged + removed entries, unions the
+    dropped entries' tags onto the kept one, and leaves unmentioned entries
+    verbatim."""
+    with tempfile.TemporaryDirectory() as d:
+        mgr = MemoryManager(d)
+        keep = mgr.add_entry("User's name is Sam", owner="alice")
+        dup = mgr.add_entry("The user is called Sam", owner="alice")
+        junk = mgr.add_entry("The assistant apologized", owner="alice")
+        distinct = mgr.add_entry("Lives in Cairo", owner="alice")
+        for e, tags in ((keep, ["identity", "shared"]), (dup, ["person-sam", "shared"]),
+                        (junk, ["shared"]), (distinct, ["shared"])):
+            e["generality"] = 2  # already triaged → straight to dedupe
+            e["tags"] = tags
+        mgr.save([keep, dup, junk, distinct])
+
+        async def fake_llm(role, messages, owner=None, **kwargs):
+            sys = messages[0]["content"]
+            if "duplicate" in sys.lower() or "MERGE" in sys:  # dedupe
+                return json.dumps({
+                    "merges": [{"keep": keep["id"], "drop": [dup["id"]]}],
+                    "remove": [junk["id"]],
+                })
+            return "[]"
+
+        monkeypatch.setattr("src.task_endpoint.memory_llm_call_async", fake_llm)
+
+        result = await cur.curate(mgr, None, owner="alice", dry_run=False)
+        assert result["status"] == "done"
+
+        stored = {e["id"]: e for e in mgr.load(owner="alice")}
+        assert set(stored) == {keep["id"], distinct["id"]}  # dup merged, junk removed
+        # dropped entry's tags folded onto the kept entry; text left verbatim
+        assert "person-sam" in stored[keep["id"]]["tags"]
+        assert "identity" in stored[keep["id"]]["tags"]
+        assert stored[keep["id"]]["text"] == "User's name is Sam"
+
+        actions = [r["action"] for r in cur.read_curation_log("alice", include_dry_run=False)]
+        assert "merge" in actions   # dup → keep
+        assert "expire" in actions  # junk removed (logged as expire for undo reuse)
+
+
+async def test_curator_passes_json_mode_to_every_smart_call(_isolated_dirs, monkeypatch):
+    """Every curator LLM pass asks the backend for JSON output (rec #1)."""
+    with tempfile.TemporaryDirectory() as d:
+        mgr = MemoryManager(d)
+        e1 = mgr.add_entry("User likes tea", owner="alice")
+        e1["generality"] = None
+        e1["provisional_tags"] = ["drinks"]
+        e1["tier"] = 0  # core → also triggers the context-doc summary pass
+        mgr.save([e1])
+
+        seen_rf = []
+
+        async def fake_llm(role, messages, owner=None, response_format=None, **kwargs):
+            seen_rf.append(response_format)
+            if "promote_tags" in messages[0]["content"]:
+                return json.dumps([{"id": e1["id"], "generality": 2, "promote_tags": ["drinks"]}])
+            return "[]"
+
+        monkeypatch.setattr("src.task_endpoint.memory_llm_call_async", fake_llm)
+        await cur.curate(mgr, None, owner="alice", dry_run=False)
+
+        assert seen_rf, "expected at least one memory-smart call"
+        assert all(rf == {"type": "json_object"} for rf in seen_rf), seen_rf
+
+
+def test_ollama_format_translation():
+    """`response_format` → Ollama's `format` field (rec #1 plumbing)."""
+    from src.llm_core import _ollama_format_from_response_format as fmt
+
+    assert fmt(None) is None
+    assert fmt({"type": "json_object"}) == "json"
+    assert fmt({"type": "text"}) is None
+    schema = {"type": "array", "items": {"type": "object"}}
+    assert fmt({"type": "json_schema", "json_schema": {"schema": schema}}) == schema
+    assert fmt({"type": "json_schema", "json_schema": {}}) == "json"  # schema absent → any JSON

@@ -473,23 +473,75 @@ def _parse_json_array(raw: str) -> Optional[List]:
     return parsed if isinstance(parsed, list) else None
 
 
+def _parse_json_object(raw: str) -> Optional[Dict]:
+    """Object-shaped counterpart of `_parse_json_array` (mirrors
+    `services/memory/retrieval.py`'s tolerance). Used by the dedupe pass, whose
+    reply is a `{"merges": [...], "remove": [...]}` object."""
+    text = (raw or "").strip()
+    try:
+        from src.text_helpers import strip_think
+        text = strip_think(text, prose=True, prompt_echo=True).strip()
+    except Exception:
+        pass
+    if text.startswith("```"):
+        text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+    start = text.find("{")
+    end = text.rfind("}")
+    if 0 <= start < end:
+        text = text[start:end + 1]
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        logger.debug("Curator got non-JSON object reply: %r", (raw or "")[:160])
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+# JSON-mode constraint sent on every curator LLM pass. Asks the serving backend
+# to restrict output to valid JSON, which eliminates the prose/prompt-echo/
+# markdown-fence failures a weak local "smart" model produces that the tolerant
+# parsers above can't recover from. `json_object` (not a strict schema) for broad
+# local-backend support — llama.cpp/vLLM/Ollama all permit JSON *arrays* under it;
+# `llm_call_async` degrades to prompt-only if a backend rejects the field.
+_JSON_MODE = {"type": "json_object"}
+
+
+def _user_message(payload: object, reminder: str) -> Dict:
+    """User turn = the JSON payload plus a trailing output-format reminder. Small
+    models weight the final user message most, so the "return only JSON" nudge
+    lands harder here than in the system prompt — belt-and-suspenders with
+    `_JSON_MODE`, and the only steer left when a backend can't honor it."""
+    return {
+        "role": "user",
+        "content": json.dumps(payload, ensure_ascii=False) + "\n\n" + reminder,
+    }
+
+
 # ---- Pass 1: triage ----
 
 TRIAGE_SYSTEM_PROMPT = (
-    "You triage a batch of personal memory entries for a memory system. For "
-    "each entry decide:\n"
-    "1. \"generality\": 0-3 — how broadly useful the fact is across future "
-    "conversations. 3 = identity-level (name, job, home city, close "
-    "relations). 2 = stable preference/relationship. 1 = project- or "
-    "time-bound context. 0 = conversation-specific trivia. HIGHER means MORE "
-    "durable/general. Only asked when the entry's generality is not already set.\n"
-    "2. \"promote_tags\": which of the entry's provisional_tags are genuinely "
-    "useful going forward and should become real tags. Provisional tags you "
-    "do NOT list are dropped as noise.\n\n"
-    "Input is a JSON array of {id, text, tags, provisional_tags, generality}. "
-    "Return a JSON array of {id, generality, promote_tags} — exactly one "
-    "object per input entry, using the SAME id. Return ONLY valid JSON, no "
-    "markdown fences, no commentary."
+    "You triage personal memory entries for a memory system. For EVERY input "
+    "entry, return one object with:\n"
+    "1. \"generality\": integer 0-3 — how broadly useful the fact is across "
+    "future conversations. 3 = identity-level (name, job, home city, close "
+    "relations). 2 = stable preference/relationship. 1 = project- or time-bound "
+    "context. 0 = conversation-specific trivia. HIGHER = MORE durable/general. "
+    "Always return a value for every entry.\n"
+    "2. \"promote_tags\": from the entry's provisional_tags, list ONLY the ones "
+    "genuinely useful going forward (these are kept). Any provisional tag you do "
+    "not list is discarded. Use [] to discard all of them.\n\n"
+    "Input: a JSON array of {id, text, tags, provisional_tags, generality}.\n"
+    "Output: a JSON array of {id, generality, promote_tags} — EXACTLY one object "
+    "per input entry, reusing the SAME id.\n\n"
+    "Example input:\n"
+    "[{\"id\": \"m1\", \"text\": \"User's name is Sam\", \"tags\": [\"identity\"], "
+    "\"provisional_tags\": [\"person-sam\", \"stray-typo\"], \"generality\": null},\n"
+    " {\"id\": \"m2\", \"text\": \"Prefers tabs over spaces\", \"tags\": [], "
+    "\"provisional_tags\": [], \"generality\": null}]\n"
+    "Example output:\n"
+    "[{\"id\": \"m1\", \"generality\": 3, \"promote_tags\": [\"person-sam\"]},\n"
+    " {\"id\": \"m2\", \"generality\": 2, \"promote_tags\": []}]\n\n"
+    "Return ONLY valid JSON, no markdown fences, no commentary."
 )
 
 TRIAGE_MAX_TOKENS = 2048
@@ -526,12 +578,13 @@ async def _triage_batch(
     ]
     messages = [
         {"role": "system", "content": TRIAGE_SYSTEM_PROMPT},
-        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+        _user_message(payload, "Return ONLY the JSON array, nothing else."),
     ]
     try:
         raw = await memory_llm_call_async(
             "smart", messages, owner=owner, interactive=interactive,
             temperature=0.1, max_tokens=TRIAGE_MAX_TOKENS,
+            response_format=_JSON_MODE,
         )
     except Exception as e:
         logger.warning("Curator triage batch failed for owner=%r: %s", owner, e)
@@ -595,24 +648,26 @@ async def _run_triage_pass(
 # ---- Pass 2: dedupe / merge ----
 
 DEDUPE_SYSTEM_PROMPT = (
-    "You are a memory database curator. Be CONSERVATIVE: remove only TRUE "
-    "duplicates and clearly useless entries. Every distinct fact must survive. "
-    "When in doubt, KEEP the entry. Return the cleaned list.\n\n"
+    "You are a memory database curator. Be CONSERVATIVE: identify only TRUE "
+    "duplicates and genuinely worthless entries. Every distinct fact must "
+    "survive. When in doubt, KEEP (merge nothing, remove nothing).\n\n"
+    "You are given a JSON array of {id, text, tags}. You do NOT rewrite entry "
+    "text — you only report which entries to MERGE or REMOVE, by id.\n\n"
     "Rules:\n"
-    "1. MERGE only entries that state the SAME fact in different words. If you "
-    "are not sure two entries are the same fact, KEEP BOTH.\n"
-    "   Merge: 'User's name is Sam' + 'The user is called Sam' -> one.\n"
-    "   Do NOT merge related-but-distinct facts: 'Likes Python' and 'Uses "
-    "Python at work' are DIFFERENT — keep both.\n"
+    "1. MERGE entries that state the SAME fact in different words. Report each "
+    "group as {\"keep\": \"<id to keep>\", \"drop\": [\"<id>\", ...]}. The "
+    "dropped entries are deleted and their tags folded into the kept entry.\n"
+    "   Merge: 'User's name is Sam' + 'The user is called Sam' -> keep one, drop "
+    "the other.\n"
+    "   Do NOT merge related-but-distinct facts: 'Likes Python' vs 'Uses Python "
+    "at work' are DIFFERENT — keep both, merge neither.\n"
     "2. REMOVE only entries that are genuinely worthless: about what the AI did "
-    "(not the user), empty, or meaningless. Do NOT drop a real fact just "
-    "because it seems minor or niche.\n"
-    "3. Keep the original wording. Only lightly trim obvious redundancy — do "
-    "NOT aggressively rewrite or shorten.\n"
-    "4. Preserve the 'id' of the entry you keep when merging.\n"
-    "5. Never invent facts. When unsure, KEEP.\n"
-    "6. Keep each entry's 'tags' list unless merging (then union the tags).\n\n"
-    "Return a JSON array of objects with fields: id, text, tags.\n"
+    "(not the user), empty, or meaningless. List their ids in \"remove\". Do NOT "
+    "remove a real fact just because it seems minor or niche.\n"
+    "3. Never invent facts or ids — use only ids present in the input. When "
+    "unsure, leave an entry out of BOTH lists (it survives unchanged).\n\n"
+    "Return a JSON object: {\"merges\": [{\"keep\": \"...\", \"drop\": "
+    "[\"...\"]}], \"remove\": [\"...\"]}. Use empty arrays when nothing applies.\n"
     "Return ONLY valid JSON, no markdown fences."
 )
 
@@ -631,6 +686,13 @@ async def _dedupe_batch(
     """Returns (surviving_entries, changelog_actions). Never raises; any
     failure or unsafe-looking result returns the batch unchanged.
 
+    The model returns MERGE/REMOVE instructions by id — it never rewrites entry
+    text (that keeps output small and un-truncatable, and makes text-mangling
+    impossible; wording "optimization" is a deliberately separate future pass,
+    not dedupe's job). This code applies them: `drop`ped entries are deleted and
+    their tags unioned onto the kept entry, `remove`d entries are deleted, and
+    every entry named in neither list survives verbatim.
+
     Appends to `failures` (if given) on an LLM/parse failure OR when the
     `>50% removed` safety guard refuses the result — both leave this
     batch's entries un-deduped, so both should block the caller from
@@ -644,12 +706,13 @@ async def _dedupe_batch(
     payload = [{"id": e["id"], "text": e.get("text", ""), "tags": e.get("tags") or []} for e in batch]
     messages = [
         {"role": "system", "content": DEDUPE_SYSTEM_PROMPT},
-        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+        _user_message(payload, "Return ONLY the JSON object, nothing else."),
     ]
     try:
         raw = await memory_llm_call_async(
             "smart", messages, owner=owner, interactive=interactive,
             temperature=0.1, max_tokens=DEDUPE_MAX_TOKENS, timeout=120,
+            response_format=_JSON_MODE,
         )
     except Exception as e:
         logger.warning("Curator dedupe batch failed for owner=%r: %s", owner, e)
@@ -657,46 +720,74 @@ async def _dedupe_batch(
             failures.append(f"dedupe:llm_error:{e}")
         return list(batch), []
 
-    cleaned = _parse_json_array(raw)
-    if cleaned is None:
+    result = _parse_json_object(raw)
+    if result is None:
         if failures is not None:
             failures.append("dedupe:non_json_reply")
         return list(batch), []
 
-    originals = {e["id"]: e for e in batch}
-    final: List[Dict] = []
-    for item in cleaned:
-        if not isinstance(item, dict):
-            continue
-        mid = item.get("id")
-        original = originals.get(mid)
-        if original is None:
-            continue
-        new_text = str(item.get("text") or "").strip()
-        if not new_text:
-            continue
-        entry = copy.deepcopy(original)
-        entry["text"] = new_text
-        if item.get("tags"):
-            entry["tags"] = normalize_tags(item["tags"])
-        final.append(entry)
+    by_id = {e["id"]: e for e in batch}
 
-    before_count, after_count = len(batch), len(final)
-    if before_count >= _UNSAFE_REMOVAL_MIN_BATCH and after_count < before_count * _UNSAFE_REMOVAL_RATIO:
+    # Collect validated merge groups (keep_entry, [drop_entries]); each id can be
+    # dropped at most once and never drops the entry it would merge into.
+    merge_groups: List[Tuple[Dict, List[Dict]]] = []
+    dropped_ids: Set[str] = set()
+    for group in (result.get("merges") or []):
+        if not isinstance(group, dict):
+            continue
+        keep = by_id.get(group.get("keep"))
+        if keep is None:
+            continue
+        drops: List[Dict] = []
+        for did in (group.get("drop") or []):
+            entry = by_id.get(did)
+            if entry is None or did == keep["id"] or did in dropped_ids:
+                continue
+            drops.append(entry)
+            dropped_ids.add(did)
+        if drops:
+            merge_groups.append((keep, drops))
+
+    remove_ids: Set[str] = {
+        rid for rid in (result.get("remove") or [])
+        if rid in by_id and rid not in dropped_ids
+    }
+
+    before_count = len(batch)
+    removed_total = len(dropped_ids) + len(remove_ids)
+    if before_count >= _UNSAFE_REMOVAL_MIN_BATCH and (before_count - removed_total) < before_count * _UNSAFE_REMOVAL_RATIO:
         logger.warning(
             "Curator dedupe batch would cut %s -> %s (>%.0f%% removed) — refusing, owner=%r",
-            before_count, after_count, _UNSAFE_REMOVAL_RATIO * 100, owner,
+            before_count, before_count - removed_total, _UNSAFE_REMOVAL_RATIO * 100, owner,
         )
         if failures is not None:
             failures.append("dedupe:unsafe_removal_refused")
         return list(batch), []
 
+    # Apply merges: union dropped entries' tags onto the kept entry.
     actions: List[Tuple[str, list, list]] = []
-    if after_count < before_count:
-        kept_ids = {e["id"] for e in final}
-        removed = [e for e in batch if e["id"] not in kept_ids]
-        actions.append(("merge", removed, final))
-    return final, actions
+    keep_updates: Dict[str, Dict] = {}
+    for keep, drops in merge_groups:
+        merged = copy.deepcopy(keep_updates.get(keep["id"], keep))
+        union = list(merged.get("tags") or [])
+        for entry in drops:
+            union += entry.get("tags") or []
+        merged["tags"] = normalize_tags(union)
+        keep_updates[keep["id"]] = merged
+        actions.append(("merge", [copy.deepcopy(d) for d in drops], [copy.deepcopy(merged)]))
+
+    survivors: List[Dict] = []
+    for e in batch:
+        if e["id"] in dropped_ids or e["id"] in remove_ids:
+            continue
+        survivors.append(keep_updates.get(e["id"], e))
+
+    # Worthless removals are logged as `expire` so they reuse the existing
+    # single-snapshot undo path (before=full entry, after=None).
+    for rid in remove_ids:
+        actions.append(("expire", copy.deepcopy(by_id[rid]), None))
+
+    return survivors, actions
 
 
 async def _run_dedupe_pass(
@@ -764,12 +855,13 @@ async def _propose_tag_merges(
     payload = [{"tag": t, "count": c} for t, c in sorted(tag_counts.items(), key=lambda kv: (-kv[1], kv[0]))]
     messages = [
         {"role": "system", "content": TAG_MERGE_SYSTEM_PROMPT},
-        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+        _user_message(payload, "Return ONLY the JSON array, nothing else."),
     ]
     try:
         raw = await memory_llm_call_async(
             "smart", messages, owner=owner, interactive=interactive,
             temperature=0.1, max_tokens=TAG_MERGE_MAX_TOKENS,
+            response_format=_JSON_MODE,
         )
     except Exception as e:
         logger.warning("Curator tag-merge proposal failed for owner=%r: %s", owner, e)
@@ -902,15 +994,17 @@ def _run_expire_pass(
 
 # ---- Pass 6: context document rebuild ----
 
+_MAX_CORE_FACTS = 30
+
 CONTEXT_SUMMARY_PROMPT = (
     "Summarize the following personal facts into a short list of core facts "
-    "about the user, removing duplicates and near-duplicates. Return a JSON "
-    "array of strings, one fact per entry. Return ONLY valid JSON, no "
-    "markdown fences, no commentary."
+    "about the user, removing duplicates and near-duplicates. Return AT MOST "
+    f"{_MAX_CORE_FACTS} facts, keeping the most durable/identity-level ones. "
+    "Return a JSON array of strings, one fact per entry. Return ONLY valid JSON, "
+    "no markdown fences, no commentary."
 )
 
 CONTEXT_SUMMARY_MAX_TOKENS = 1024
-_MAX_CORE_FACTS = 30
 
 
 async def _summarize_core_facts(
@@ -925,12 +1019,13 @@ async def _summarize_core_facts(
 
     messages = [
         {"role": "system", "content": CONTEXT_SUMMARY_PROMPT},
-        {"role": "user", "content": json.dumps(texts, ensure_ascii=False)},
+        _user_message(texts, "Return ONLY the JSON array of strings, nothing else."),
     ]
     try:
         raw = await memory_llm_call_async(
             "smart", messages, owner=owner, interactive=interactive,
             temperature=0.1, max_tokens=CONTEXT_SUMMARY_MAX_TOKENS,
+            response_format=_JSON_MODE,
         )
         parsed = _parse_json_array(raw)
         if parsed is None:

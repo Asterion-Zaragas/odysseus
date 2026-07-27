@@ -611,6 +611,25 @@ def _ollama_normalize_messages(messages: List[Dict]) -> List[Dict]:
 _ollama_normalize_tool_messages = _ollama_normalize_messages
 
 
+def _ollama_format_from_response_format(response_format: Optional[Dict]) -> Optional[object]:
+    """Translate an OpenAI-style ``response_format`` into Ollama's ``format``.
+
+    Ollama's ``format`` accepts the string ``"json"`` (any valid JSON) or a raw
+    JSON-schema object. Map ``{"type": "json_object"}`` -> ``"json"`` and pass a
+    ``{"type": "json_schema", "json_schema": {"schema": {...}}}`` through as the
+    bare schema object. Returns None for anything unrecognized (no constraint).
+    """
+    if not response_format:
+        return None
+    rf_type = response_format.get("type")
+    if rf_type == "json_object":
+        return "json"
+    if rf_type == "json_schema":
+        schema = (response_format.get("json_schema") or {}).get("schema")
+        return schema or "json"
+    return None
+
+
 def _build_ollama_payload(
     model: str,
     messages: List[Dict],
@@ -619,6 +638,7 @@ def _build_ollama_payload(
     stream: bool = False,
     tools: Optional[List[Dict]] = None,
     num_ctx: Optional[int] = None,
+    response_format: Optional[Dict] = None,
 ) -> Dict:
     """Build the JSON payload for Ollama's /api/chat endpoint.
 
@@ -647,6 +667,9 @@ def _build_ollama_payload(
         payload["options"] = options
     if tools:
         payload["tools"] = tools
+    fmt = _ollama_format_from_response_format(response_format)
+    if fmt is not None:
+        payload["format"] = fmt
     return payload
 
 
@@ -1960,8 +1983,19 @@ async def llm_call_async(
     prompt_type: Optional[str] = None,
     session_id: Optional[str] = None,
     workload: str = "foreground",
+    response_format: Optional[Dict] = None,
 ) -> str:
-    """Asynchronous LLM call using httpx with connection pooling, timeout, retry logic, and performance logging."""
+    """Asynchronous LLM call using httpx with connection pooling, timeout, retry logic, and performance logging.
+
+    ``response_format`` (OpenAI-style, e.g. ``{"type": "json_object"}``) asks the
+    serving backend to constrain output to valid JSON. It is applied to the
+    OpenAI-compatible and Ollama paths (Ollama via its ``format`` field); ignored
+    for Anthropic (which does JSON via tool-forcing). Best-effort: a backend that
+    rejects the field (HTTP 400/422) is retried once without it, so an
+    unsupporting endpoint degrades to prompt-only rather than failing. The sync
+    ``llm_call`` deliberately has no equivalent — only the async path needs it
+    (memory-system JSON passes).
+    """
     provider = _detect_provider(url)
     messages_copy = _sanitize_llm_messages(messages)
 
@@ -2040,6 +2074,7 @@ async def llm_call_async(
         payload = _build_ollama_payload(
             model, messages_copy, temperature, max_tokens,
             stream=False, num_ctx=get_context_length(url, model),
+            response_format=response_format,
         )
     else:
         target_url = _normalize_openai_chat_url(url)
@@ -2057,6 +2092,8 @@ async def llm_call_async(
         if max_tokens and max_tokens > 0:
             tok_key = "max_completion_tokens" if _uses_max_completion_tokens(model) else "max_tokens"
             payload[tok_key] = max_tokens
+        if response_format:
+            payload["response_format"] = response_format
         # Suppress thinking for qwen3/gemma4 on Ollama /v1 — same as stream_llm.
         if _is_ollama_openai_compat_url(url) and _supports_thinking(model):
             payload["think"] = False
@@ -2085,6 +2122,21 @@ async def llm_call_async(
                     f"LLM async call to {target_url} failed in {duration:.2f}s "
                     f"(attempt {attempt}): HTTP {r.status_code} {friendly}"
                 )
+                # A backend that doesn't understand response_format/format tends
+                # to 400/422. Drop the constraint and retry once (prompt-only)
+                # rather than permanently failing the call — this attempt is not
+                # counted against max_retries.
+                if r.status_code in (400, 422) and response_format is not None and (
+                    "response_format" in payload or "format" in payload
+                ):
+                    logger.info(
+                        "Retrying %s without response_format (backend rejected it)", target_url
+                    )
+                    payload.pop("response_format", None)
+                    payload.pop("format", None)
+                    response_format = None
+                    attempt -= 1
+                    continue
                 if r.status_code in (429, 502, 503, 504) and attempt < max_retries:
                     await asyncio.sleep(LLMConfig.RETRY_DELAY)
                     continue
