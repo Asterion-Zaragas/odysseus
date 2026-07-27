@@ -12579,6 +12579,7 @@ textarea.memory-add-input {
 .memory-curator-log-action.action-dedupe { background: color-mix(in srgb, var(--hl-string) 15%, transparent); color: var(--hl-string); }
 .memory-curator-log-action.action-promote { background: color-mix(in srgb, #98c379 15%, transparent); color: #98c379; }
 .memory-curator-log-action.action-demote { background: color-mix(in srgb, #d19a66 15%, transparent); color: #d19a66; }
+.memory-curator-log-action.action-quarantine { background: color-mix(in srgb, var(--red) 15%, transparent); color: var(--red); }
 .memory-curator-log-detail {
   flex: 1;
   min-width: 0;

@@ -741,6 +741,7 @@ async function initMemorySystemSettings() {
   var contextDocToggle = el('set-memoryContextDocToggle');
   var expiryDaysInput = el('set-memoryExpiryDays');
   var protectedTagsInput = el('set-memoryProtectedTags');
+  var quarantineAfterInput = el('set-memoryQuarantineAfter');
   var msg = el('set-memorySystemMsg');
   if (!registryCapInput) return;
 
@@ -758,6 +759,7 @@ async function initMemorySystemSettings() {
     if (contextDocToggle) contextDocToggle.checked = !!settings.memory_context_doc_injection;
     if (settings.memory_archive_expiry_days != null) expiryDaysInput.value = settings.memory_archive_expiry_days;
     if (settings.memory_protected_tags != null) protectedTagsInput.value = settings.memory_protected_tags;
+    if (quarantineAfterInput && settings.memory_curator_quarantine_after != null) quarantineAfterInput.value = settings.memory_curator_quarantine_after;
   } catch (e) { console.warn('Failed to load memory system settings', e); }
 
   async function saveMemorySystem() {
@@ -782,6 +784,10 @@ async function initMemorySystemSettings() {
     var expiry = parseInt(expiryDaysInput.value, 10);
     if (!isNaN(expiry)) payload.memory_archive_expiry_days = expiry;
     payload.memory_protected_tags = protectedTagsInput.value || '';
+    if (quarantineAfterInput) {
+      var quarantineAfter = parseInt(quarantineAfterInput.value, 10);
+      if (!isNaN(quarantineAfter)) payload.memory_curator_quarantine_after = quarantineAfter;
+    }
     try {
       await fetch('/api/auth/settings', { method: 'POST', credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json' },

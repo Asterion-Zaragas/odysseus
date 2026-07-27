@@ -16,6 +16,36 @@ is skipped, never aborts the run (`_triage_batch` / `_dedupe_batch` /
 `_propose_tag_merges` all degrade to "no-op for this batch" on any
 LLM/parse failure).
 
+Resilience escalation for the two entry-batched passes (triage, dedupe;
+`_run_pass_resilient`): since `cluster_batches` is fully deterministic given
+unchanged content, a batch that fails would otherwise fail *identically*
+every single future run. Three cheapest-first layers:
+  1. **In-run retry** — the same batch content is retried a couple of times
+     (`non_json_reply` and `llm_error` only) before being treated as failed;
+     catches ordinary model flakiness at ~zero cost.
+  2. **Bisection** — a batch that still fails with `non_json_reply` (and
+     ONLY that reason — see below) is split in half and each half retried/
+     bisected recursively down to single entries. Smaller prompts are both
+     less likely to trip a weak model's format-following AND, if one entry's
+     content really is the problem, isolates it instead of leaving the
+     whole batch un-triaged/un-deduped.
+  3. **Quarantine** — if a single entry alone still fails the same pass
+     across `memory_curator_quarantine_after` separate `curate()` runs
+     (data/memory_curation_failures/<owner>.json), it's excluded from that
+     pass's batches until a human clears it (Curator tab) — a backstop so a
+     chronically-bad entry doesn't burn LLM calls forever while blocking
+     itself from ever being triaged/deduped.
+Deliberately NOT bisected/quarantined: dedupe's `>50% removed` safety-guard
+refusal (`unsafe_removal_refused`) is a considered judgment the model made
+correctly, not a parse/format failure — shrinking the batch until it drops
+below `_UNSAFE_REMOVAL_MIN_BATCH` would silently defeat the guard rather than
+fix anything, so that reason is never retried, bisected, or quarantined; the
+whole batch is left unchanged exactly as before this feature existed.
+`llm_error` (the call itself raised — timeout/network/API error) IS retried
+(transient failures are exactly what a retry is for) but never bisected — a
+dead/slow endpoint fails at any batch size, so shrinking it just multiplies
+calls against something that isn't coming back this run.
+
 Two-phase, auditable destructiveness: the curator can only *demote* a
 memory to the archive tier (pure code, `_run_rescore_pass`); actual
 deletion only happens in `_run_expire_pass` for archive-tier entries that
@@ -54,6 +84,7 @@ logger = logging.getLogger(__name__)
 
 CURATION_STATE_DIR = os.path.join(DATA_DIR, "memory_curation_state")
 CURATION_LOG_DIR = os.path.join(DATA_DIR, "memory_curation_log")
+CURATION_FAILURES_DIR = os.path.join(DATA_DIR, "memory_curation_failures")
 
 # Pass order for a full curation run. Checkpointing is at pass granularity:
 # a crash/shutdown mid-run resumes at the next NOT-yet-completed pass rather
@@ -230,6 +261,193 @@ def cluster_batches(entries: List[Dict], batch_size: int) -> List[List[Dict]]:
     return batches
 
 
+# ---- resilience: per-entry-per-pass failure tracking + quarantine ----
+#
+# Sidecar (mirrors the checkpoint/tidy-state sidecar pattern) rather than a
+# field on the entry itself: keeps MemoryManager's schema and
+# _fingerprint_entries (id+text+tags only) untouched, and keeps this bookkeeping
+# out of exports/API responses that read entries directly.
+# Shape: {"<entry_id>": {"<pass_name>": {"count": int, "last_error": str,
+#                                          "last_ts": float, "quarantined": bool}}}
+
+def _failure_state_path(owner: Optional[str]) -> str:
+    return os.path.join(CURATION_FAILURES_DIR, f"{_owner_slug(owner)}.json")
+
+
+def _load_failure_state(owner: Optional[str]) -> Dict:
+    try:
+        with open(_failure_state_path(owner), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_failure_state(owner: Optional[str], state: Dict) -> None:
+    os.makedirs(CURATION_FAILURES_DIR, exist_ok=True)
+    path = _failure_state_path(owner)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f)
+    os.replace(tmp, path)
+
+
+def _quarantined_ids(state: Dict, pass_name: str) -> Set[str]:
+    return {eid for eid, passes in state.items() if (passes.get(pass_name) or {}).get("quarantined")}
+
+
+def _quarantine_threshold() -> int:
+    from src.settings import get_setting
+    return max(1, int(get_setting("memory_curator_quarantine_after", 3) or 3))
+
+
+def _handle_quarantine_candidate(owner: Optional[str], pass_name: str, entry: Dict, reason: str, dry_run: bool) -> None:
+    """Called on the terminal single-entry failure of a bisectable reason —
+    bumps that entry's failure count for this pass and flips `quarantined`
+    once the threshold is crossed. Dry runs preview (log a `quarantine` line
+    with the projected count) without ever writing the sidecar, matching how
+    every other pass already logs proposed-but-unapplied actions."""
+    entry_id = entry.get("id")
+    if entry_id is None:
+        return
+    threshold = _quarantine_threshold()
+
+    if dry_run:
+        state = _load_failure_state(owner)
+        prior = ((state.get(entry_id) or {}).get(pass_name) or {}).get("count", 0)
+        _log_action(
+            owner, "quarantine",
+            before=None,
+            after={"id": entry_id, "pass": pass_name, "count": prior + 1, "threshold": threshold, "error": reason},
+            dry_run=True,
+        )
+        return
+
+    state = _load_failure_state(owner)
+    rec = state.setdefault(entry_id, {}).setdefault(pass_name, {"count": 0, "quarantined": False})
+    rec["count"] = rec.get("count", 0) + 1
+    rec["last_error"] = reason
+    rec["last_ts"] = time.time()
+    newly_quarantined = rec["count"] >= threshold and not rec.get("quarantined")
+    if newly_quarantined:
+        rec["quarantined"] = True
+    _save_failure_state(owner, state)
+    if newly_quarantined:
+        _log_action(
+            owner, "quarantine",
+            before=None,
+            after={"id": entry_id, "pass": pass_name, "count": rec["count"], "error": reason},
+            dry_run=False,
+        )
+
+
+def clear_quarantine(memory_manager, owner: Optional[str], entry_id: str, pass_name: Optional[str] = None) -> bool:
+    """Manual recovery (Curator tab "clear"/"retry" button): un-quarantines
+    one pass, or every pass, for a given entry so the next curate() run
+    includes it again. Returns True iff something was actually cleared.
+
+    Also invalidates the saved tidy fingerprint: un-quarantining doesn't
+    change the entry's id/text/tags (what the fingerprint tracks), so
+    without this the next curate() call would still see a matching
+    fingerprint and short-circuit on `already_tidy`, never actually
+    retrying the entry we just un-quarantined."""
+    state = _load_failure_state(owner)
+    passes = state.get(entry_id)
+    if not passes:
+        return False
+    names = [pass_name] if pass_name else list(passes.keys())
+    cleared = []
+    for name in names:
+        rec = passes.get(name)
+        if rec and rec.get("quarantined"):
+            rec["quarantined"] = False
+            rec["count"] = 0
+            cleared.append(name)
+    if not cleared:
+        return False
+    _save_failure_state(owner, state)
+    for name in cleared:
+        _log_action(owner, "unquarantine", before=None, after={"id": entry_id, "pass": name})
+    _invalidate_tidy_state(memory_manager, owner)
+    return True
+
+
+def list_quarantined(owner: Optional[str]) -> List[Dict]:
+    """Every currently-quarantined (entry, pass) pair for an owner, for the
+    Curator tab's manual-review list."""
+    state = _load_failure_state(owner)
+    out = []
+    for entry_id, passes in state.items():
+        for pass_name, rec in passes.items():
+            if rec.get("quarantined"):
+                out.append({
+                    "id": entry_id, "pass": pass_name, "count": rec.get("count", 0),
+                    "last_error": rec.get("last_error"), "last_ts": rec.get("last_ts"),
+                })
+    return out
+
+
+# In-run retry attempts beyond the first, same batch/content — cheap, catches
+# ordinary model flakiness. Bisection only kicks in once these are exhausted.
+_BATCH_RETRY_ATTEMPTS = 2
+_BISECT_MIN_SIZE = 1
+# Only a parse failure is plausibly content-correlated enough to bisect; see
+# module docstring for why llm_error and unsafe_removal_refused are excluded.
+_BISECTABLE_REASONS = {"non_json_reply"}
+
+
+def _classify_reason(local_failures: List[str]) -> Optional[str]:
+    """`local_failures` entries look like '<pass>:llm_error:<detail>',
+    '<pass>:non_json_reply', or '<pass>:unsafe_removal_refused' (the only
+    strings `_triage_batch`/`_dedupe_batch` ever append) — returns just the
+    category, or None if nothing was appended (a legitimate no-op result)."""
+    if not local_failures:
+        return None
+    last = local_failures[-1]
+    for cat in ("non_json_reply", "unsafe_removal_refused", "llm_error"):
+        if cat in last:
+            return cat
+    return "unknown"
+
+
+async def _run_pass_resilient(
+    batch: List[Dict], call_batch, combine, owner: Optional[str], pass_name: str,
+    dry_run: bool, master_failures: Optional[List[str]],
+):
+    """Runs `call_batch(sub_batch, local_failures) -> value` over `batch`,
+    escalating retry -> bisect -> quarantine on a persistent failure (see
+    module docstring). `combine(value, value) -> value` merges two bisected
+    halves back together (list concatenation for triage's actions, tuple-wise
+    concatenation for dedupe's (survivors, actions)).
+
+    Exactly one entry is appended to `master_failures` per unresolved leaf
+    (not per retry attempt) — this is what still gates `curate()`'s
+    tidy-fingerprint save."""
+    attempts = 1 + _BATCH_RETRY_ATTEMPTS
+    value = None
+    reason = None
+    for _ in range(attempts):
+        local: List[str] = []
+        value = await call_batch(batch, local)
+        reason = _classify_reason(local)
+        if reason is None:
+            return value
+        if reason == "unsafe_removal_refused":
+            break  # a considered judgment, not a transient/content glitch — never retried
+
+    if reason in _BISECTABLE_REASONS and len(batch) > _BISECT_MIN_SIZE:
+        mid = len(batch) // 2
+        left = await _run_pass_resilient(batch[:mid], call_batch, combine, owner, pass_name, dry_run, master_failures)
+        right = await _run_pass_resilient(batch[mid:], call_batch, combine, owner, pass_name, dry_run, master_failures)
+        return combine(left, right)
+
+    if master_failures is not None:
+        master_failures.append(f"{pass_name}:{reason}")
+    if reason in _BISECTABLE_REASONS and len(batch) == _BISECT_MIN_SIZE:
+        _handle_quarantine_candidate(owner, pass_name, batch[0], reason, dry_run)
+    return value
+
+
 # ---- tolerant JSON array parsing (mirrors memory_extractor's tolerance for
 # reasoning-model noise; kept local rather than imported — see
 # memory_tagger's identical precedent for its object-shaped counterpart) ----
@@ -361,9 +579,14 @@ async def _run_triage_pass(
     entries: List[Dict], owner: Optional[str], batch_size: int, dry_run: bool, interactive: bool = False,
     failures: Optional[List[str]] = None,
 ) -> List[Dict]:
-    pending = [e for e in entries if _needs_triage(e)]
+    quarantined = _quarantined_ids(_load_failure_state(owner), "triage")
+    pending = [e for e in entries if _needs_triage(e) and e.get("id") not in quarantined]
+
+    async def call_batch(sub_batch: List[Dict], local_failures: List[str]) -> List[Tuple[str, Dict, Dict]]:
+        return await _triage_batch(sub_batch, owner, dry_run, interactive, local_failures)
+
     for batch in cluster_batches(pending, batch_size):
-        actions = await _triage_batch(batch, owner, dry_run, interactive, failures)
+        actions = await _run_pass_resilient(batch, call_batch, lambda a, b: a + b, owner, "triage", dry_run, failures)
         for action, before, after in actions:
             _log_action(owner, action, before=before, after=after, dry_run=dry_run)
     return entries
@@ -480,13 +703,27 @@ async def _run_dedupe_pass(
     entries: List[Dict], owner: Optional[str], batch_size: int, dry_run: bool, interactive: bool = False,
     failures: Optional[List[str]] = None,
 ) -> List[Dict]:
+    quarantined = _quarantined_ids(_load_failure_state(owner), "dedupe")
+    exempt = [e for e in entries if e.get("id") in quarantined]
+    eligible = [e for e in entries if e.get("id") not in quarantined]
+
+    async def call_batch(sub_batch: List[Dict], local_failures: List[str]) -> Tuple[List[Dict], List[Tuple[str, list, list]]]:
+        return await _dedupe_batch(sub_batch, owner, interactive, local_failures)
+
+    def combine(a, b):
+        return (a[0] + b[0], a[1] + b[1])
+
     survivors: List[Dict] = []
-    for batch in cluster_batches(entries, batch_size):
-        final, actions = await _dedupe_batch(batch, owner, interactive, failures)
+    for batch in cluster_batches(eligible, batch_size):
+        final, actions = await _run_pass_resilient(batch, call_batch, combine, owner, "dedupe", dry_run, failures)
         survivors.extend(final)
         for action, before, after in actions:
             _log_action(owner, action, before=before, after=after, dry_run=dry_run)
-    return survivors
+    # Quarantined entries were never sent to the LLM, but dedupe's output IS
+    # the new surviving set — they must still come back, or they'd silently
+    # vanish from the store (unlike triage, which returns all `entries`
+    # regardless and just skips mutating the quarantined ones).
+    return survivors + exempt
 
 
 # ---- Pass 3: tag normalization ----
@@ -873,7 +1110,8 @@ async def triage_new_entries(memory_manager, owner: Optional[str] = None) -> Dic
 
     all_entries = memory_manager.load_all()
     existing = _entries_for_owner(all_entries, owner)
-    pending = [copy.deepcopy(e) for e in existing if _needs_triage(e)]
+    quarantined = _quarantined_ids(_load_failure_state(owner), "triage")
+    pending = [copy.deepcopy(e) for e in existing if _needs_triage(e) and e.get("id") not in quarantined]
     if not pending:
         return {"triaged": 0}
 
@@ -918,3 +1156,24 @@ def _save_tidy_state(path: str, owner: Optional[str], fingerprint: str) -> None:
             json.dump(state, f, indent=2)
     except OSError as e:
         logger.warning("Could not persist curator tidy fingerprint: %s", e)
+
+
+def _invalidate_tidy_state(memory_manager, owner: Optional[str]) -> None:
+    """Drop a saved tidy fingerprint so the next `curate()` call doesn't
+    short-circuit on `already_tidy`. Needed by `clear_quarantine`: unlike
+    every other curator mutation, un-quarantining an entry changes nothing
+    the fingerprint tracks (id+text+tags) — the entry's content never
+    changed, only the sidecar's `quarantined` flag did — so without this the
+    fingerprint would still match and the un-quarantined entry would never
+    actually get retried."""
+    path = _tidy_state_path(memory_manager)
+    state = _load_tidy_state(path)
+    key = owner or ""
+    if key not in state:
+        return
+    del state[key]
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2)
+    except OSError as e:
+        logger.warning("Could not invalidate curator tidy fingerprint: %s", e)

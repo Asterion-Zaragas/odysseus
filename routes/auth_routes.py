@@ -660,6 +660,7 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
             "memory_curator_batch": (1, 200),
             "memory_recall_k": (1, 5),
             "memory_archive_expiry_days": (1, 3650),
+            "memory_curator_quarantine_after": (1, 50),
         }
         _FLOAT_RANGES = {
             "memory_facet_timeout": (0.5, 120.0),

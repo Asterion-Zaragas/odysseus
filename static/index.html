@@ -363,6 +363,13 @@
             <div id="memory-curator-summary" class="memory-curator-summary"></div>
             <div id="memory-curator-log" class="memory-list memory-curator-log"></div>
           </div>
+          <div id="memory-quarantine-card" class="admin-card hidden">
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:2px;">
+              <h2 style="margin:0;padding:0;line-height:1;"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:6px;color:var(--accent, var(--red));"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>Needs review</h2>
+            </div>
+            <p class="memory-desc doclib-desc" style="margin-top:6px;">These entries kept failing the same curator pass on their own after repeated retries, so the curator stopped feeding them to the LLM. They're still fully usable in chat — clear one to let the curator try it again (e.g. after editing its text).</p>
+            <div id="memory-quarantine-list" class="memory-list"></div>
+          </div>
           <div class="admin-card">
             <div style="display:flex;align-items:center;gap:8px;margin-bottom:2px;">
               <h2 style="margin:0;padding:0;line-height:1;"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:6px;color:var(--accent, var(--red));"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>Context doc</h2>
@@ -1630,6 +1637,10 @@
               <div class="settings-row">
                 <label class="settings-label">Protected tags</label>
                 <input id="set-memoryProtectedTags" type="text" placeholder="contact,identity" class="settings-select" style="width:382.5px;flex:0 0 auto;margin-left:auto;">
+              </div>
+              <div class="settings-row">
+                <label class="settings-label" title="If a single memory keeps failing the same curator pass on its own (after in-run retries and splitting the batch down to just that entry) across this many separate curator runs, it's quarantined from that pass until you clear it from the Curator tab.">Quarantine after (failed runs)</label>
+                <input id="set-memoryQuarantineAfter" type="text" inputmode="numeric" placeholder="3" class="settings-select" style="width:382.5px;flex:0 0 auto;margin-left:auto;">
               </div>
               <div id="set-memorySystemMsg" style="font-size:11px;color:color-mix(in srgb, var(--fg) 45%, transparent);"></div>
             </div>

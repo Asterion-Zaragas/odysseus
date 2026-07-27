@@ -783,7 +783,7 @@ async function runCuratorApply(force) {
       message = `Curator: ${data.removed} removed (${data.before} → ${data.after})`;
     }
     showToast(message);
-    await Promise.all([loadCuratorLog(), loadContextDoc(), loadMemories()]);
+    await Promise.all([loadCuratorLog(), loadContextDoc(), loadMemories(), loadQuarantineList()]);
   } catch (error) {
     console.error('Curator run failed:', error);
     showError('Curator run failed — check console');
@@ -828,6 +828,13 @@ function renderCuratorSummary(entries, container) {
 }
 
 function _describeCuratorAction(entry) {
+  if (entry.action === 'quarantine' && entry.after) {
+    const a = entry.after;
+    return `${a.pass} pass gave up on this entry after ${a.count} failure(s) (${a.error || 'unknown error'})`;
+  }
+  if (entry.action === 'unquarantine' && entry.after) {
+    return `${entry.after.pass} pass will retry this entry`;
+  }
   const text = (entry.after && entry.after.text) || (entry.before && entry.before.text);
   if (text) return text;
   const tags = (entry.after && entry.after.tags) || (entry.before && entry.before.tags);
@@ -913,9 +920,74 @@ async function loadContextDoc() {
   }
 }
 
+async function loadQuarantineList() {
+  const card = document.getElementById('memory-quarantine-card');
+  const listEl = document.getElementById('memory-quarantine-list');
+  if (!card || !listEl) return;
+  try {
+    const res = await fetch(`${window.location.origin}/api/memory/quarantine`);
+    if (!res.ok) throw new Error(`status ${res.status}`);
+    const data = await res.json();
+    const items = data.quarantined || [];
+    card.classList.toggle('hidden', items.length === 0);
+    renderQuarantineList(items, listEl);
+  } catch (error) {
+    console.error('Failed to load quarantined memories:', error);
+  }
+}
+
+function renderQuarantineList(items, container) {
+  container.innerHTML = '';
+  items.forEach(item => {
+    const row = document.createElement('div');
+    row.className = 'memory-curator-log-item';
+
+    const badge = document.createElement('span');
+    badge.className = 'memory-curator-log-action action-quarantine';
+    badge.textContent = item.pass || 'unknown';
+    row.appendChild(badge);
+
+    const detail = document.createElement('span');
+    detail.className = 'memory-curator-log-detail';
+    const text = item.text != null ? item.text : '(memory no longer exists)';
+    detail.textContent = `${text} — failed ${item.count}x (${item.last_error || 'unknown error'})`;
+    detail.title = detail.textContent;
+    row.appendChild(detail);
+
+    const clearBtn = document.createElement('button');
+    clearBtn.className = 'memory-item-btn memory-curator-log-undo';
+    clearBtn.textContent = 'retry';
+    clearBtn.addEventListener('click', () => clearMemoryQuarantine(item.id, item.pass, clearBtn));
+    row.appendChild(clearBtn);
+
+    container.appendChild(row);
+  });
+}
+
+async function clearMemoryQuarantine(memoryId, passName, btn) {
+  if (btn) { btn.disabled = true; btn.textContent = '…'; }
+  try {
+    const res = await fetch(`${window.location.origin}/api/memory/quarantine/clear`, {
+      method: 'POST',
+      body: new URLSearchParams({ memory_id: memoryId, pass_name: passName })
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || 'Clear failed');
+    }
+    showToast('Cleared — will be retried on the next curator run');
+    await loadQuarantineList();
+  } catch (error) {
+    console.error('Clear quarantine failed:', error);
+    showError('Clear failed — check console');
+    if (btn) { btn.disabled = false; btn.textContent = 'retry'; }
+  }
+}
+
 function loadCuratorTab() {
   loadCuratorLog();
   loadContextDoc();
+  loadQuarantineList();
 }
 
 // ---- Filtering helper ----

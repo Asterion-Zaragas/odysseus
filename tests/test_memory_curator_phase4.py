@@ -181,6 +181,7 @@ def test_checkpoint_round_trips(tmp_path, monkeypatch):
 def _isolated_dirs(tmp_path, monkeypatch):
     monkeypatch.setattr(cur, "CURATION_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setattr(cur, "CURATION_LOG_DIR", str(tmp_path / "log"))
+    monkeypatch.setattr(cur, "CURATION_FAILURES_DIR", str(tmp_path / "failures"))
     return tmp_path
 
 
@@ -519,3 +520,193 @@ async def test_triage_new_entries_only_touches_pending(_isolated_dirs, monkeypat
         stored = {e["id"]: e for e in mgr.load(owner="alice")}
         assert stored[done["id"]]["generality"] == 3  # untouched
         assert stored[pending["id"]]["generality"] == 1
+
+
+# ── resilience: in-run retry, bisection, quarantine ──
+
+async def test_run_pass_resilient_retries_before_giving_up(_isolated_dirs):
+    calls = {"n": 0}
+
+    async def call_batch(batch, local_failures):
+        calls["n"] += 1
+        if calls["n"] < 2:
+            local_failures.append("triage:non_json_reply")
+            return []
+        return ["ok"]
+
+    result = await cur._run_pass_resilient(
+        [{"id": "a"}], call_batch, lambda a, b: a + b, owner="alice", pass_name="triage",
+        dry_run=False, master_failures=None,
+    )
+    assert result == ["ok"]
+    assert calls["n"] == 2  # succeeded on retry, no need to exhaust every attempt
+
+
+async def test_run_pass_resilient_bisects_and_isolates_poison_entry(_isolated_dirs):
+    poison_id = "poison"
+    batch = [{"id": str(i)} for i in range(4)] + [{"id": poison_id}]
+
+    async def call_batch(sub_batch, local_failures):
+        if any(e["id"] == poison_id for e in sub_batch):
+            local_failures.append("triage:non_json_reply")
+            return []
+        return [e["id"] for e in sub_batch]
+
+    failures = []
+    result = await cur._run_pass_resilient(
+        batch, call_batch, lambda a, b: a + b, owner="alice", pass_name="triage",
+        dry_run=False, master_failures=failures,
+    )
+    # Every non-poison id made it through; only the poison leaf is unresolved.
+    assert set(result) == {"0", "1", "2", "3"}
+    assert failures == ["triage:non_json_reply"]
+    # One run only bumps the failure count once (below the default threshold
+    # of 3) — it doesn't quarantine yet, but the leaf failure was tracked.
+    state = cur._load_failure_state("alice")
+    assert state[poison_id]["triage"]["count"] == 1
+    assert cur.list_quarantined("alice") == []
+
+
+async def test_run_pass_resilient_unsafe_removal_refused_never_retried_or_bisected(_isolated_dirs):
+    calls = {"n": 0}
+
+    async def call_batch(batch, local_failures):
+        calls["n"] += 1
+        local_failures.append("dedupe:unsafe_removal_refused")
+        return list(batch), []
+
+    batch = [{"id": str(i)} for i in range(10)]
+    failures = []
+    result = await cur._run_pass_resilient(
+        batch, call_batch, lambda a, b: (a[0] + b[0], a[1] + b[1]), owner="alice", pass_name="dedupe",
+        dry_run=False, master_failures=failures,
+    )
+    assert calls["n"] == 1  # never retried
+    assert result[0] == batch  # batch unchanged, exactly like before this feature
+    assert failures == ["dedupe:unsafe_removal_refused"]
+    assert cur.list_quarantined("alice") == []  # this reason never quarantines
+
+
+async def test_run_pass_resilient_llm_error_retried_but_never_bisected(_isolated_dirs):
+    calls = {"n": 0}
+
+    async def call_batch(batch, local_failures):
+        calls["n"] += 1
+        local_failures.append("triage:llm_error:boom")
+        return []
+
+    batch = [{"id": str(i)} for i in range(5)]
+    failures = []
+    result = await cur._run_pass_resilient(
+        batch, call_batch, lambda a, b: a + b, owner="alice", pass_name="triage",
+        dry_run=False, master_failures=failures,
+    )
+    assert calls["n"] == 3  # 1 + _BATCH_RETRY_ATTEMPTS, same 5-entry batch every time
+    assert failures == ["triage:llm_error"]
+    assert cur.list_quarantined("alice") == []  # llm_error is retryable but never quarantine-eligible
+
+
+async def test_curate_triage_bisection_isolates_poison_entry_in_shared_batch(_isolated_dirs, monkeypatch):
+    """A batch clustered by a shared tag (cluster_batches puts them together)
+    where one entry's content always breaks the model's JSON output: the
+    fine entries must still get triaged this run instead of the whole batch
+    being left untouched."""
+    import json
+
+    with tempfile.TemporaryDirectory() as d:
+        mgr = MemoryManager(d)
+        fine_entries = [mgr.add_entry(f"fact {i}", owner="alice") for i in range(4)]
+        for e in fine_entries:
+            e["generality"] = None
+            e["tags"] = ["shared"]
+        poison = mgr.add_entry("poison fact", owner="alice")
+        poison["generality"] = None
+        poison["tags"] = ["shared"]
+        mgr.save(fine_entries + [poison])
+
+        async def fake_llm(role, messages, owner=None, **kwargs):
+            sys = messages[0]["content"]
+            if "promote_tags" in sys:  # triage
+                payload = json.loads(messages[-1]["content"])
+                if any(item["id"] == poison["id"] for item in payload):
+                    return "the model rambles instead of returning JSON"
+                return json.dumps([{"id": item["id"], "generality": 2, "promote_tags": []} for item in payload])
+            if "duplicate" in sys.lower() or "MERGE" in sys:  # dedupe: keep everything unchanged
+                payload = json.loads(messages[-1]["content"])
+                return json.dumps(payload)
+            return "[]"  # tag-merge / context-facts summary
+
+        monkeypatch.setattr("src.task_endpoint.memory_llm_call_async", fake_llm)
+
+        result = await cur.curate(mgr, None, owner="alice", dry_run=False)
+        assert result["had_failures"] is True
+
+        stored = {e["id"]: e for e in mgr.load(owner="alice")}
+        assert len(stored) == 5  # nothing lost — dedupe kept everything unchanged
+        for e in fine_entries:
+            assert stored[e["id"]]["generality"] == 2
+        assert stored[poison["id"]]["generality"] is None
+
+
+async def test_quarantine_after_repeated_runs_excludes_entry_and_can_be_cleared(_isolated_dirs, monkeypatch):
+    with tempfile.TemporaryDirectory() as d:
+        mgr = MemoryManager(d)
+        e1 = mgr.add_entry("weird entry", owner="alice")
+        e1["generality"] = None
+        mgr.save([e1])
+
+        calls = {"n": 0}
+
+        async def fake_llm(role, messages, owner=None, **kwargs):
+            calls["n"] += 1
+            if "promote_tags" in messages[0]["content"]:
+                return "not json at all"
+            return "[]"
+
+        monkeypatch.setattr("src.task_endpoint.memory_llm_call_async", fake_llm)
+
+        # Default memory_curator_quarantine_after is 3 separate runs.
+        for _ in range(3):
+            result = await cur.curate(mgr, None, owner="alice", dry_run=False)
+            assert result["had_failures"] is True
+
+        quarantined = cur.list_quarantined("alice")
+        assert len(quarantined) == 1
+        assert quarantined[0]["id"] == e1["id"]
+        assert quarantined[0]["pass"] == "triage"
+
+        calls_before_4th = calls["n"]
+        result4 = await cur.curate(mgr, None, owner="alice", dry_run=False)
+        # Quarantined entry is excluded from triage batching entirely now —
+        # no new LLM calls, and nothing left to fail.
+        assert calls["n"] == calls_before_4th
+        assert result4["had_failures"] is False
+
+        # Manual clear -> the entry is fed to the curator again.
+        assert cur.clear_quarantine(mgr, "alice", e1["id"], "triage") is True
+        assert cur.list_quarantined("alice") == []
+        await cur.curate(mgr, None, owner="alice", dry_run=False)
+        assert calls["n"] > calls_before_4th
+
+
+async def test_quarantine_dry_run_previews_without_persisting(_isolated_dirs, monkeypatch):
+    with tempfile.TemporaryDirectory() as d:
+        mgr = MemoryManager(d)
+        e1 = mgr.add_entry("weird entry", owner="alice")
+        e1["generality"] = None
+        mgr.save([e1])
+
+        async def fake_llm(role, messages, owner=None, **kwargs):
+            if "promote_tags" in messages[0]["content"]:
+                return "not json"
+            return "[]"
+
+        monkeypatch.setattr("src.task_endpoint.memory_llm_call_async", fake_llm)
+
+        for _ in range(5):  # well past the real threshold, but always dry_run
+            result = await cur.curate(mgr, None, owner="alice", dry_run=True)
+            assert result["status"] == "dry_run"
+
+        assert cur.list_quarantined("alice") == []  # dry runs never persist quarantine state
+        log = cur.read_curation_log("alice", include_dry_run=True)
+        assert any(rec["action"] == "quarantine" and rec["dry_run"] for rec in log)

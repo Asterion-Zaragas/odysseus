@@ -194,6 +194,12 @@ DEFAULT_SETTINGS = {
     "memory_archive_expiry_days": 90,
     # Comma-separated tags the curator may never delete/expire (still mergeable/renameable).
     "memory_protected_tags": "contact,identity",
+    # Triage/dedupe: how many separate curate() runs a single entry may fail
+    # (after in-run retry + bisection already isolated it) before the curator
+    # quarantines it for that pass — excluded from further LLM calls until a
+    # human clears it from the Curator tab. See memory_curator.py's module
+    # docstring for the retry -> bisect -> quarantine escalation.
+    "memory_curator_quarantine_after": 3,
     "teacher_model": "",
     "teacher_enabled": False,
     "teacher_tier2_enabled": False,

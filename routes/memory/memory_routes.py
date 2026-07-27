@@ -27,7 +27,7 @@ from src.memory import compat_category, normalize_tags
 from src.request_models import MemoryAddRequest
 from core.database import SessionLocal
 from src.llm_core import llm_call_async
-from services.memory.memory_curator import curate, read_curation_log, undo_expire
+from services.memory.memory_curator import curate, read_curation_log, undo_expire, clear_quarantine, list_quarantined
 from services.memory.memory_context import MemoryContext
 from src.auth_helpers import get_current_user, require_user
 from src.endpoint_resolver import resolve_endpoint
@@ -388,6 +388,34 @@ def setup_memory_routes(memory_manager: MemoryManager, session_manager: SessionM
         user = _owner(request)
         if not undo_expire(memory_manager, memory_vector, user, memory_id):
             raise HTTPException(404, "No expired memory found with that id")
+        return {"ok": True}
+
+    @router.get("/quarantine")
+    def get_quarantined_memories(request: Request):
+        """Entries the curator has stopped feeding to a given pass (triage/
+        dedupe) after `memory_curator_quarantine_after` separate runs kept
+        failing on that entry alone — see memory_curator.py's module
+        docstring. Enriched with the entry's current text so the Curator tab
+        can show something more useful than a bare id."""
+        user = _owner(request)
+        quarantined = list_quarantined(user)
+        if not quarantined:
+            return {"quarantined": []}
+        by_id = {e["id"]: e for e in memory_manager.load(owner=user)}
+        for q in quarantined:
+            entry = by_id.get(q["id"])
+            q["text"] = entry.get("text", "") if entry else None
+        return {"quarantined": quarantined}
+
+    @router.post("/quarantine/clear")
+    def clear_quarantined_memory(request: Request, memory_id: str = Form(...), pass_name: str | None = Form(None)):
+        """Manually clear a quarantine flag (Curator tab "retry" button) so
+        the next curator run includes this entry in that pass again."""
+        from src.auth_helpers import require_privilege
+        require_privilege(request, "can_manage_memory")
+        user = _owner(request)
+        if not clear_quarantine(memory_manager, user, memory_id, pass_name):
+            raise HTTPException(404, "No quarantine found for that entry/pass")
         return {"ok": True}
 
     @router.post("/import")
