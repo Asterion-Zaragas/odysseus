@@ -676,6 +676,8 @@ function _appendPinnedServeModel(fd, task) {
 function _isImageServeTask(task) {
   const cmd = String(task?.payload?._cmd || '');
   return cmd.includes('diffusion_server') || cmd.includes('mlx_image_server');
+}
+
 // Cosmetic per-model display name typed into the Cookbook serve panel's
 // "Friendly name" field — threads it onto the model-endpoint row being
 // created so the chat model picker shows it (friendly name first, raw
