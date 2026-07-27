@@ -735,9 +735,13 @@ async function runCuratorPreview() {
     const data = await res.json();
     if (resultEl) {
       resultEl.classList.remove('hidden');
-      resultEl.textContent = data.already_tidy
+      let text = data.already_tidy
         ? 'Preview: already clean — nothing to do.'
         : `Preview: would remove ${data.removed} (${data.before} → ${data.after}). Nothing was saved — click "Run curator" to apply.`;
+      if (data.had_failures) {
+        text += ` (${data.failure_count} batch(es) failed to get a usable model reply — review before going live.)`;
+      }
+      resultEl.textContent = text;
     }
   } catch (error) {
     console.error('Curator preview failed:', error);
@@ -747,28 +751,49 @@ async function runCuratorPreview() {
   }
 }
 
-async function runCuratorApply() {
+async function runCuratorApply(force) {
   // No confirmation dialog — mirrors the Browse tab's "Tidy" button, which
   // is the same /api/memory/audit (dry_run=false) call under a different label.
-  const btn = document.getElementById('memory-curator-run-btn');
+  // `force=true` (the "Force run" button) bypasses the "already clean"
+  // fingerprint short-circuit — use it to retry batches a prior run
+  // silently skipped (e.g. a model that failed to reply with valid JSON).
+  const btnId = force ? 'memory-curator-force-btn' : 'memory-curator-run-btn';
+  const idleLabel = force ? 'Force run' : 'Run curator';
+  const btn = document.getElementById(btnId);
   if (btn) { btn.disabled = true; btn.textContent = 'Running…'; }
   try {
-    const res = await fetch(`${window.location.origin}/api/memory/audit`, { method: 'POST' });
+    const res = await fetch(`${window.location.origin}/api/memory/audit`, {
+      method: 'POST',
+      body: force ? new URLSearchParams({ force: 'true' }) : undefined,
+    });
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
       throw new Error(err.detail || 'Curator run failed');
     }
     const data = await res.json();
-    showToast(data.already_tidy || !data.removed
-      ? 'Already clean'
-      : `Curator: ${data.removed} removed (${data.before} → ${data.after})`);
+    let message;
+    if (data.had_failures) {
+      // Some batches never got a usable LLM reply (or were refused by the
+      // dedupe safety guard); the tidy fingerprint wasn't saved for this
+      // run, so a future run will retry them automatically.
+      message = `Curator: ${data.removed} removed (${data.before} → ${data.after}), but ${data.failure_count} batch(es) failed — will retry automatically next run.`;
+    } else if (data.already_tidy || !data.removed) {
+      message = 'Already clean';
+    } else {
+      message = `Curator: ${data.removed} removed (${data.before} → ${data.after})`;
+    }
+    showToast(message);
     await Promise.all([loadCuratorLog(), loadContextDoc(), loadMemories()]);
   } catch (error) {
     console.error('Curator run failed:', error);
     showError('Curator run failed — check console');
   } finally {
-    if (btn) { btn.disabled = false; btn.textContent = 'Run curator'; }
+    if (btn) { btn.disabled = false; btn.textContent = idleLabel; }
   }
+}
+
+async function runCuratorForce() {
+  return runCuratorApply(true);
 }
 
 async function loadCuratorLog() {
@@ -1763,7 +1788,10 @@ document.addEventListener('DOMContentLoaded', () => {
   if (curatorPreviewBtn) curatorPreviewBtn.addEventListener('click', runCuratorPreview);
 
   const curatorRunBtn = document.getElementById('memory-curator-run-btn');
-  if (curatorRunBtn) curatorRunBtn.addEventListener('click', runCuratorApply);
+  if (curatorRunBtn) curatorRunBtn.addEventListener('click', () => runCuratorApply(false));
+
+  const curatorForceBtn = document.getElementById('memory-curator-force-btn');
+  if (curatorForceBtn) curatorForceBtn.addEventListener('click', runCuratorForce);
 
   const contextDocRefreshBtn = document.getElementById('memory-context-doc-refresh-btn');
   if (contextDocRefreshBtn) contextDocRefreshBtn.addEventListener('click', loadContextDoc);

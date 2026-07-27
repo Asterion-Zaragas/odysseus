@@ -356,6 +356,7 @@
               <span style="flex:1"></span>
               <button id="memory-curator-preview-btn" class="theme-io-btn" title="Run the full curator pipeline without saving anything — see what it would do" style="height:26px;font-size:12px;">Preview (dry run)</button>
               <button id="memory-curator-run-btn" class="theme-io-btn" title="Run the full curator pipeline for real: dedupe, retag, rescore, expire, rebuild context doc" style="height:26px;font-size:12px;">Run curator</button>
+              <button id="memory-curator-force-btn" class="theme-io-btn" title="Run for real even if the store looks already clean — use this to retry batches a prior run silently skipped (e.g. due to a model error)" style="height:26px;font-size:12px;">Force run</button>
             </div>
             <p class="memory-desc doclib-desc" style="margin-top:6px;">Dedupes, normalizes tags, rescores tiers, expires stale archive memories, and rebuilds the context doc below. Runs nightly; trigger it manually here.</p>
             <div id="memory-curator-preview-result" class="memory-curator-preview-result hidden"></div>

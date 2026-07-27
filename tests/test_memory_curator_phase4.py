@@ -290,6 +290,7 @@ async def test_curate_second_run_short_circuits_on_fingerprint(_isolated_dirs, m
 
         first = await cur.curate(mgr, None, owner="alice", dry_run=False)
         assert first["status"] == "done"
+        assert first["had_failures"] is False  # legitimate "[]" replies aren't failures
         calls_after_first = calls["n"]
 
         second = await cur.curate(mgr, None, owner="alice", dry_run=False)
@@ -339,6 +340,10 @@ async def test_curate_dedupe_unsafe_removal_refused(_isolated_dirs, monkeypatch)
         result = await cur.curate(mgr, None, owner="alice", dry_run=False)
         stored = mgr.load(owner="alice")
         assert len(stored) == 10  # unsafe removal refused, nothing lost
+        # The refused batch left its entries un-deduped, same as a real
+        # failure would — must block the tidy fingerprint save so a future
+        # run retries it instead of accepting it as permanently "clean".
+        assert result["had_failures"] is True
 
 
 async def test_curate_resumes_after_checkpoint_skips_completed_passes(_isolated_dirs, monkeypatch):
@@ -401,6 +406,95 @@ async def test_curate_persists_each_pass_so_a_later_crash_keeps_earlier_work(_is
         assert "drinks" in stored[0]["tags"]
         assert stored[0]["provisional_tags"] == []
         assert cur._load_checkpoint("alice")["last_completed_pass"] == "tag_normalize"
+
+
+# ── failure-aware fingerprint gating + force run ──
+
+async def test_curate_non_json_reply_blocks_fingerprint_and_next_run_retries(_isolated_dirs, monkeypatch):
+    """Regression for the "curator says already clean, but nothing was ever
+    tagged" bug: if a batch's LLM reply never parses as JSON, that's a real
+    failure (distinct from a legitimate "[]" reply) and must stop `curate()`
+    from saving the tidy fingerprint — otherwise every future run
+    (including the nightly loop) short-circuits on `already_tidy` forever
+    without ever retrying the un-triaged entries."""
+    with tempfile.TemporaryDirectory() as d:
+        mgr = MemoryManager(d)
+        e1 = mgr.add_entry("User likes tea", owner="alice")
+        e1["generality"] = None
+        e1["provisional_tags"] = ["drinks"]
+        mgr.save([e1])
+
+        calls = {"n": 0}
+
+        async def fake_llm(role, messages, owner=None, **kwargs):
+            calls["n"] += 1
+            if "promote_tags" in messages[0]["content"]:
+                # Simulate the local model echoing its own instructions
+                # instead of returning JSON (seen repeatedly in production).
+                return "*   Input: A JSON array of memory entries...\n    *   Task:"
+            return "[]"
+
+        monkeypatch.setattr("src.task_endpoint.memory_llm_call_async", fake_llm)
+
+        first = await cur.curate(mgr, None, owner="alice", dry_run=False)
+        assert first["status"] == "done"
+        assert first["had_failures"] is True
+        assert first["failure_count"] >= 1
+        # The entry was never actually triaged.
+        stored = mgr.load(owner="alice")
+        assert stored[0]["generality"] is None
+
+        calls_after_first = calls["n"]
+        second = await cur.curate(mgr, None, owner="alice", dry_run=False)
+        # Must NOT short-circuit — the fingerprint was never saved.
+        assert second.get("already_tidy") is not True
+        assert calls["n"] > calls_after_first  # the triage batch was retried
+
+
+async def test_curate_force_bypasses_tidy_fingerprint(_isolated_dirs, monkeypatch):
+    with tempfile.TemporaryDirectory() as d:
+        mgr = MemoryManager(d)
+        # Already-triaged and sharing a tag, so every run's dedupe pass
+        # clusters both into one real (>=2-entry) batch and calls the LLM,
+        # regardless of whether triage has anything left to do — this is
+        # what lets us observe whether `force` actually re-ran the passes.
+        e1 = mgr.add_entry("User likes tea", owner="alice")
+        e1["generality"] = 2
+        e1["tags"] = ["drinks"]
+        e2 = mgr.add_entry("User likes coffee", owner="alice")
+        e2["generality"] = 2
+        e2["tags"] = ["drinks"]
+        mgr.save([e1, e2])
+
+        calls = {"n": 0}
+
+        async def fake_llm(role, messages, owner=None, **kwargs):
+            calls["n"] += 1
+            sys = messages[0]["content"]
+            if "duplicate" in sys.lower() or "MERGE" in sys:
+                # Keep both entries unchanged (valid JSON, no removal).
+                import json as _json
+                payload = _json.loads(messages[-1]["content"])
+                return _json.dumps(payload)
+            return "[]"
+
+        monkeypatch.setattr("src.task_endpoint.memory_llm_call_async", fake_llm)
+
+        first = await cur.curate(mgr, None, owner="alice", dry_run=False)
+        assert first["status"] == "done"
+        assert first["had_failures"] is False
+        calls_after_first = calls["n"]
+        assert calls_after_first > 0  # sanity: the dedupe pass really ran
+
+        # Without force: short-circuits, no new calls.
+        second = await cur.curate(mgr, None, owner="alice", dry_run=False)
+        assert second["already_tidy"] is True
+        assert calls["n"] == calls_after_first
+
+        # With force=True: bypasses the fingerprint check and actually runs.
+        third = await cur.curate(mgr, None, owner="alice", dry_run=False, force=True)
+        assert third["already_tidy"] is False
+        assert calls["n"] > calls_after_first
 
 
 # ── triage_new_entries (cheap extractor-trigger path) ──

@@ -314,7 +314,7 @@ def setup_memory_routes(memory_manager: MemoryManager, session_manager: SessionM
             return {"suggestions": [item["text"] for item in fallback]}
 
     @router.post("/audit")
-    async def api_audit_memories(request: Request, dry_run: bool = Form(False)):
+    async def api_audit_memories(request: Request, dry_run: bool = Form(False), force: bool = Form(False)):
         """Run the memory curator for the caller: dedupe/merge, tag
         normalization, tier rescoring, archive expiry, and a context-doc
         rebuild — batched, nightly-run's manual-trigger twin.
@@ -323,7 +323,10 @@ def setup_memory_routes(memory_manager: MemoryManager, session_manager: SessionM
         Memory Models), falling back through the background-task chain like
         every other memory-system agent — no per-request model resolution
         needed here anymore. `dry_run=true` runs the full pipeline and logs
-        proposed actions without writing anything back.
+        proposed actions without writing anything back. `force=true` (the
+        Curator tab's "Force run" button) bypasses the tidy-fingerprint
+        short-circuit so a real pass runs even if the store already looks
+        "clean" — e.g. to retry batches a prior run silently no-op'd on.
         """
         user = _owner(request)
         # interactive=True: this runs INLINE inside the audit request, which is
@@ -331,7 +334,7 @@ def setup_memory_routes(memory_manager: MemoryManager, session_manager: SessionM
         # False (the nightly-loop default) would make curate()'s memory-smart
         # calls wait for the request count to hit zero — i.e. wait on this very
         # request — and deadlock (button stuck on "Running…", no LLM call made).
-        result = await curate(memory_manager, memory_vector, owner=user, dry_run=dry_run, interactive=True)
+        result = await curate(memory_manager, memory_vector, owner=user, dry_run=dry_run, interactive=True, force=force)
 
         return {
             "ok": True,
@@ -344,6 +347,12 @@ def setup_memory_routes(memory_manager: MemoryManager, session_manager: SessionM
             # use / debugging.
             "already_tidy": bool(result.get("already_tidy")),
             "dry_run": dry_run,
+            # True if any batch failed to get a usable LLM reply (or was
+            # refused by the dedupe safety guard) — those batches were left
+            # un-curated and will be retried automatically on the next run
+            # since the tidy fingerprint isn't saved in that case.
+            "had_failures": bool(result.get("had_failures")),
+            "failure_count": result.get("failure_count", 0),
         }
 
     @router.get("/curation-log")
