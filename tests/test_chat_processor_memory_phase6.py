@@ -1,7 +1,14 @@
 """Phase 6 of the memory upgrade: ChatProcessor.build_context_preface's memory
-section — core (pinned + tier-0) always-inject vs. context-doc toggle,
-per-turn effort/doc overrides falling back to settings, and staged retrieval
-over the non-core "rest" pool.
+section — core (pinned + tier-0) capped/relevance-gated injection vs.
+context-doc toggle, per-turn effort/doc overrides falling back to settings,
+and staged retrieval over the non-core "rest" pool.
+
+Core injection is capped via _select_core_memories: identity/contact-tagged
+entries are always available, but a pinned or tier-0 entry with no identity
+signal must match the current message (via the staged retrieval pipeline,
+same as "rest") to be injected — pinned/core no longer means "inject
+everything, every turn," which used to bloat every request and leak
+unrelated personal context into tasks that didn't need it.
 
 build_context_preface is async as of this phase (it awaits
 services.memory.retrieval.retrieve); these tests exercise that directly
@@ -36,12 +43,25 @@ def _joined(preface):
     return "\n".join(m.get("content") or "" for m in preface)
 
 
-async def test_pinned_and_tier0_are_always_injected_as_core(monkeypatch):
+async def test_identity_core_always_injected_but_irrelevant_pinned_is_capped(monkeypatch):
+    """Identity/contact-tagged core memories bypass relevance-gating entirely.
+
+    A pinned or tier-0 entry with no identity signal is no longer injected
+    unconditionally: it must clear the same staged-retrieval bar as an
+    ordinary "rest" memory. Here the retrieval pipeline is faked to find
+    nothing relevant to "hi", so the plain tier-0 fact is dropped while the
+    identity-tagged pinned fact still comes through.
+    """
     monkeypatch.setattr("src.settings.get_setting", lambda key, default=None: default)
+
+    async def fake_retrieve(message, entries, *, effort, memory_vector, owner, k, interactive):
+        return {"memories": [], "facets": None, "effort_used": effort}
+
+    monkeypatch.setattr("src.chat_processor.memory_retrieve", fake_retrieve)
+
     mm = _FakeMemoryManager([
-        _entry("p", "Pinned fact about the user", tier=2, pinned=True),
-        _entry("t0", "Tier zero identity fact", tier=0, pinned=False),
-        _entry("s", "Some unrelated situational note", tier=2, pinned=False),
+        _entry("p", "User's name is Alex", tier=2, pinned=True, tags=["identity"]),
+        _entry("t0", "Some tier-0 fact unrelated to anything", tier=0, pinned=False),
     ])
     processor = ChatProcessor(memory_manager=mm, personal_docs_manager=SimpleNamespace(rag_manager=None))
 
@@ -51,21 +71,26 @@ async def test_pinned_and_tier0_are_always_injected_as_core(monkeypatch):
     )
 
     joined = _joined(preface)
-    assert "Pinned fact about the user" in joined
-    assert "Tier zero identity fact" in joined
+    assert "User's name is Alex" in joined
+    assert "Some tier-0 fact unrelated to anything" not in joined
     kinds = {m["text"]: m["type"] for m in processor._last_used_memories}
-    assert kinds["Pinned fact about the user"] == "pinned"
-    assert kinds["Tier zero identity fact"] == "core"
+    assert kinds == {"User's name is Alex": "pinned"}
 
 
-async def test_context_doc_toggle_suppresses_nonpinned_core_but_keeps_pinned(monkeypatch):
+async def test_context_doc_toggle_suppresses_nonpinned_core_and_caps_irrelevant_pinned(monkeypatch):
     monkeypatch.setattr("src.settings.get_setting", lambda key, default=None: default)
     monkeypatch.setattr(
         "services.memory.memory_context.MemoryContext.render_markdown",
         lambda self: "# Memory context\n\nMOCKED DOC BODY",
     )
+
+    async def fake_retrieve(message, entries, *, effort, memory_vector, owner, k, interactive):
+        return {"memories": [], "facets": None, "effort_used": effort}
+
+    monkeypatch.setattr("src.chat_processor.memory_retrieve", fake_retrieve)
+
     mm = _FakeMemoryManager([
-        _entry("p", "Pinned fact about the user", tier=2, pinned=True),
+        _entry("p", "User's name is Alex", tier=2, pinned=True, tags=["identity"]),
         _entry("t0", "Tier zero identity fact", tier=0, pinned=False),
     ])
     processor = ChatProcessor(memory_manager=mm, personal_docs_manager=SimpleNamespace(rag_manager=None))
@@ -77,12 +102,12 @@ async def test_context_doc_toggle_suppresses_nonpinned_core_but_keeps_pinned(mon
 
     joined = _joined(preface)
     assert "MOCKED DOC BODY" in joined
-    assert "Pinned fact about the user" in joined
+    assert "User's name is Alex" in joined
     # The non-pinned tier-0 entry is covered by the doc's core-facts section
     # instead of being injected individually (avoids duplication).
     assert "Tier zero identity fact" not in joined
     kinds = {m["text"]: m["type"] for m in processor._last_used_memories}
-    assert kinds == {"Pinned fact about the user": "pinned"}
+    assert kinds == {"User's name is Alex": "pinned"}
 
 
 async def test_rest_entries_flow_through_staged_retrieve(monkeypatch):

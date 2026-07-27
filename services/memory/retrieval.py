@@ -366,8 +366,9 @@ async def retrieve(
     """Staged retrieval over a candidate pool of memory entries.
 
     `entries` is the pool to search — callers decide what's in it (e.g. the
-    chat preface excludes pinned/tier-0 entries it already injects
-    unconditionally; the ``retrieve_memory_context`` tool passes everything).
+    chat preface excludes pinned/tier-0 entries, which go through their own
+    capped/identity-gated selection in ``ChatProcessor._select_core_memories``
+    instead; the ``retrieve_memory_context`` tool passes everything).
 
     Returns ``{"memories": [...], "facets": dict|None, "effort_used": str,
     "facet_degraded": bool}``. `effort_used` is always the (normalized)

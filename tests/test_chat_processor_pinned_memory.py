@@ -27,7 +27,8 @@ def _processor(rows):
     return ChatProcessor(memory_manager=_Memory(rows), personal_docs_manager=_Docs())
 
 
-def test_pinned_memory_does_not_inject_every_unrelated_fact():
+async def test_pinned_memory_does_not_inject_every_unrelated_fact(monkeypatch):
+    monkeypatch.setattr("src.settings.get_setting", lambda key, default=None: default)
     rows = [
         {
             "id": "identity",
@@ -52,11 +53,12 @@ def test_pinned_memory_does_not_inject_every_unrelated_fact():
         },
     ]
 
-    preface, _, _ = _processor(rows).build_context_preface(
+    preface, _, _ = await _processor(rows).build_context_preface(
         message="Explain how Python decorators work",
         session=SimpleNamespace(),
         use_rag=False,
         use_memory=True,
+        memory_effort="low",
     )
 
     text = _context_text(preface)
@@ -65,13 +67,15 @@ def test_pinned_memory_does_not_inject_every_unrelated_fact():
     assert "dark roast coffee" not in text
 
 
-def test_relevant_pinned_memory_is_still_injected():
+async def test_relevant_pinned_memory_is_still_injected(monkeypatch):
+    monkeypatch.setattr("src.settings.get_setting", lambda key, default=None: default)
     rows = [
         {
             "id": "coffee",
             "text": "User likes dark roast coffee.",
             "category": "preference",
             "pinned": True,
+            "tier": 1,
             "timestamp": 1,
         },
         {
@@ -79,15 +83,17 @@ def test_relevant_pinned_memory_is_still_injected():
             "text": "User is planning a birthday party with sack races.",
             "category": "fact",
             "pinned": True,
+            "tier": 1,
             "timestamp": 2,
         },
     ]
 
-    preface, _, _ = _processor(rows).build_context_preface(
+    preface, _, _ = await _processor(rows).build_context_preface(
         message="likes coffee roast",
         session=SimpleNamespace(),
         use_rag=False,
         use_memory=True,
+        memory_effort="low",
     )
 
     text = _context_text(preface)
@@ -95,7 +101,8 @@ def test_relevant_pinned_memory_is_still_injected():
     assert "birthday party with sack races" not in text
 
 
-def test_pinned_memory_injection_is_capped_at_five():
+async def test_pinned_memory_injection_is_capped_at_five(monkeypatch):
+    monkeypatch.setattr("src.settings.get_setting", lambda key, default=None: default)
     rows = [
         {
             "id": f"identity-{idx}",
@@ -108,17 +115,25 @@ def test_pinned_memory_injection_is_capped_at_five():
     ]
 
     processor = _processor(rows)
-    processor.build_context_preface(
+    await processor.build_context_preface(
         message="Who is the user?",
         session=SimpleNamespace(),
         use_rag=False,
         use_memory=True,
+        memory_effort="low",
     )
 
     assert len(processor._last_used_memories) == 5
 
 
-def test_total_memory_injection_is_capped_at_five_across_pinned_and_recalled():
+async def test_pinned_and_recalled_memories_are_capped_independently(monkeypatch):
+    """Pinned/core and recalled ("rest") memories are two separate budgets
+    (PINNED_MEMORY_LIMIT and the memory_recall_k setting), not one shared
+    total — that split is what lets memory_recall_k be tuned independently
+    of how many pinned/core facts a user happens to have. This replaces an
+    older assumption of one combined cap of five across both groups.
+    """
+    monkeypatch.setattr("src.settings.get_setting", lambda key, default=None: default)
     rows = [
         {
             "id": f"identity-{idx}",
@@ -141,12 +156,16 @@ def test_total_memory_injection_is_capped_at_five_across_pinned_and_recalled():
     ])
 
     processor = _processor(rows)
-    processor.build_context_preface(
+    await processor.build_context_preface(
         message="likes coffee roast",
         session=SimpleNamespace(),
         use_rag=False,
         use_memory=True,
+        memory_effort="low",
     )
 
-    assert len(processor._last_used_memories) <= 5
-    assert sum(1 for m in processor._last_used_memories if m["type"] == "pinned") == 4
+    used = processor._last_used_memories
+    pinned_count = sum(1 for m in used if m["type"] == "pinned")
+    recalled_count = sum(1 for m in used if m["type"] == "recalled")
+    assert pinned_count == 4  # all 4 match the identity marker, under PINNED_MEMORY_LIMIT (5)
+    assert recalled_count <= 3  # default memory_recall_k

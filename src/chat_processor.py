@@ -63,9 +63,9 @@ class ChatProcessor:
     PINNED_MEMORY_LIMIT = MEMORY_CONTEXT_LIMIT
 
     def _is_core_memory(self, memory: Dict[str, Any]) -> bool:
-        """Return whether a pinned memory is safe to keep globally available."""
-        category = (memory.get("category") or "").lower()
-        if category in {"identity", "contact"}:
+        """Return whether a pinned/core memory is safe to keep globally available."""
+        tags = memory.get("tags") or []
+        if "identity" in tags or "contact" in tags:
             return True
         text = (memory.get("text") or "").lower()
         return any(marker in text for marker in (
@@ -79,16 +79,19 @@ class ChatProcessor:
             "address",
         ))
 
-    def _select_pinned_memories(self, message: str, pinned: list) -> list:
-        """Keep pinned memories high-priority without injecting all of them.
+    async def _select_core_memories(
+        self, message: str, core: list, *, owner: Optional[str], effort: str,
+    ) -> list:
+        """Keep core/pinned memories high-priority without injecting all of them.
 
-        Pinned used to mean "always send every pinned memory to the model".
-        That bloats every request and leaks unrelated personal context into
-        tasks that do not need it. Now only a small set of core identity/contact
-        memories is always available; other pinned memories must match the
-        current request, but are retrieved before ordinary memories.
+        Pinned/tier-0 used to mean "always send every one of these to the
+        model". That bloats every request and leaks unrelated personal
+        context into tasks that don't need it. Only a small set of core
+        identity/contact memories is always available; the rest must match
+        the current request (via the staged retrieval pipeline), but are
+        preferred ahead of ordinary, non-core memories.
         """
-        if not pinned:
+        if not core:
             return []
 
         def _recent_first(memory: Dict[str, Any]) -> int:
@@ -97,27 +100,29 @@ class ChatProcessor:
             except Exception:
                 return 0
 
-        core = sorted(
-            [m for m in pinned if self._is_core_memory(m)],
+        identity = sorted(
+            [m for m in core if self._is_core_memory(m)],
             key=_recent_first,
             reverse=True,
         )[:self.PINNED_MEMORY_LIMIT]
 
-        core_ids = {m.get("id") for m in core if m.get("id")}
+        identity_ids = {m.get("id") for m in identity if m.get("id")}
         contextual_candidates = [
-            m for m in pinned
-            if not (m.get("id") and m.get("id") in core_ids)
+            m for m in core
+            if not (m.get("id") and m.get("id") in identity_ids)
         ]
-        remaining_slots = max(self.PINNED_MEMORY_LIMIT - len(core), 0)
-        contextual = self._hybrid_retrieve(
-            message,
-            contextual_candidates,
-            k=remaining_slots,
-        ) if remaining_slots else []
+        remaining_slots = max(self.PINNED_MEMORY_LIMIT - len(identity), 0)
+        contextual = []
+        if remaining_slots and contextual_candidates:
+            result = await memory_retrieve(
+                message, contextual_candidates, effort=effort, memory_vector=self.memory_vector,
+                owner=owner, k=remaining_slots, interactive=True,
+            )
+            contextual = result["memories"]
 
         selected = []
         seen = set()
-        for memory in [*core, *contextual]:
+        for memory in [*identity, *contextual]:
             key = memory.get("id") or memory.get("text")
             if key in seen:
                 continue
@@ -199,34 +204,42 @@ class ChatProcessor:
 
                 doc_text = MemoryContext(owner).render_markdown()
                 preface.append(untrusted_context_message("saved memory: context document", doc_text))
-                # Pinned entries are always injected individually regardless of
-                # the toggle; non-pinned tier-0 entries are covered by the doc's
-                # core-facts section above, so they're suppressed here to avoid
-                # duplication.
+                # Pinned entries are considered for individual injection
+                # regardless of the toggle (capped/relevance-filtered below so
+                # a long pinned list doesn't bloat every request); non-pinned
+                # tier-0 entries are covered by the doc's core-facts section
+                # above, so they're suppressed here to avoid duplication.
                 pinned_only = [m for m in core if m.get("pinned")]
-                if pinned_only:
-                    pinned_text = "\n- ".join([m["text"] for m in pinned_only])
+                selected_pinned = await self._select_core_memories(
+                    message, pinned_only, owner=owner, effort=memory_effort,
+                )
+                if selected_pinned:
+                    pinned_text = "\n- ".join([m["text"] for m in selected_pinned])
                     preface.append(untrusted_context_message(
                         "saved memory: pinned user facts",
                         f"Core facts about the user:\n- {pinned_text}",
                     ))
-                    for m in pinned_only:
+                    for m in selected_pinned:
                         self._last_used_memories.append({"text": m["text"], "tags": m.get("tags") or [], "type": "pinned"})
                         if m.get("id"):
                             _used_ids.append(m["id"])
             elif core:
-                core_text = "\n- ".join([m["text"] for m in core])
-                preface.append(untrusted_context_message(
-                    "saved memory: pinned user facts",
-                    f"Core facts about the user:\n- {core_text}",
-                ))
-                for m in core:
-                    self._last_used_memories.append({
-                        "text": m["text"], "tags": m.get("tags") or [],
-                        "type": "pinned" if m.get("pinned") else "core",
-                    })
-                    if m.get("id"):
-                        _used_ids.append(m["id"])
+                selected_core = await self._select_core_memories(
+                    message, core, owner=owner, effort=memory_effort,
+                )
+                if selected_core:
+                    core_text = "\n- ".join([m["text"] for m in selected_core])
+                    preface.append(untrusted_context_message(
+                        "saved memory: pinned user facts",
+                        f"Core facts about the user:\n- {core_text}",
+                    ))
+                    for m in selected_core:
+                        self._last_used_memories.append({
+                            "text": m["text"], "tags": m.get("tags") or [],
+                            "type": "pinned" if m.get("pinned") else "core",
+                        })
+                        if m.get("id"):
+                            _used_ids.append(m["id"])
 
             if rest:
                 recall_k = int(get_setting("memory_recall_k", 3) or 3)

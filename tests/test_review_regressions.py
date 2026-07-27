@@ -470,7 +470,10 @@ async def test_build_chat_context_incognito_ignores_saved_session_history(monkey
         headers={},
         get_context_messages=lambda: [{"role": "user", "content": "older non-incognito secret"}],
     )
-    chat_processor = SimpleNamespace(build_context_preface=lambda **kwargs: ([], [], []))
+    async def fake_build_context_preface(**kwargs):
+        return [], [], []
+
+    chat_processor = SimpleNamespace(build_context_preface=fake_build_context_preface)
 
     ctx = await chat_helpers.build_chat_context(
         sess=sess,
