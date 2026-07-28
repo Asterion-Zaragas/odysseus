@@ -56,7 +56,9 @@ EXTRACT_SYSTEM_PROMPT_TEMPLATE = (
     "EXCLUDE — do not extract:\n"
     "- what the user is asking about right now, or the current task\n"
     "- transient moods, one-off requests, or small talk\n"
-    "- anything the ASSISTANT said, not the user\n"
+    "- anything the ASSISTANT said, not the user — including opinions or "
+    "preferences the assistant states about itself in the first person "
+    "(\"I prefer X\", \"I recommend Y\"); never attribute these to the user\n"
     "- facts already known (see \"Already known\" below) — do not repeat them "
     "or close paraphrases\n"
     "- speculation, or facts you are not confident the user actually stated\n\n"
@@ -70,7 +72,11 @@ EXTRACT_SYSTEM_PROMPT_TEMPLATE = (
     "  user: \"ugh, today has been rough\" -> [] (transient mood)\n"
     "  user: \"I really can't stand cilantro\" -> "
     "[{{\"text\": \"User dislikes cilantro.\", \"durability\": 0.6, "
-    "\"context_hint\": \"discussing food preferences\"}}]\n\n"
+    "\"context_hint\": \"discussing food preferences\"}}]\n"
+    "  user: \"What's a good python web framework?\"\n"
+    "  assistant: \"FastAPI is great, I personally prefer it for new "
+    "projects.\" -> [] (the preference is the ASSISTANT's own opinion, not "
+    "something the user stated about themselves)\n\n"
     "Already known about this user — do NOT re-extract these or close "
     "paraphrases:\n{known_facts}\n\n"
     "Known topic tags (context only, do not put tags in your output):\n"
@@ -345,7 +351,12 @@ async def extract_and_store(
                     b.get("text", "") for b in c
                     if isinstance(b, dict) and b.get("type") == "text"
                 )
-            return f"{m.get('role', '?')}: {c}"
+            role = m.get("role", "?")
+            # Labeled inline (not just described in the system prompt) so the
+            # "never a user fact" rule survives even if the model doesn't
+            # fully track which system-prompt bullet applies to which turn.
+            label = "assistant (context only — never a source of user facts)" if role == "assistant" else role
+            return f"{label}: {c}"
 
         transcript = "\n\n".join(_flatten_msg(m) for m in stripped_recent)
         extraction_messages = [
