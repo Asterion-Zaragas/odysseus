@@ -835,6 +835,9 @@ function _describeCuratorAction(entry) {
   if (entry.action === 'unquarantine' && entry.after) {
     return `${entry.after.pass} pass will retry this entry`;
   }
+  if (entry.action === 'reword_refused' && entry.before) {
+    return `Reword declined: ${entry.before.reason || 'guard check failed'}`;
+  }
   const text = (entry.after && entry.after.text) || (entry.before && entry.before.text);
   if (text) return text;
   const tags = (entry.after && entry.after.tags) || (entry.before && entry.before.tags);
@@ -871,11 +874,11 @@ function renderCuratorLogList(entries, container) {
       row.appendChild(time);
     }
 
-    if (entry.action === 'expire' && entry.before && entry.before.id) {
+    if ((entry.action === 'expire' || entry.action === 'reword') && entry.before && entry.before.id) {
       const undoBtn = document.createElement('button');
       undoBtn.className = 'memory-item-btn memory-curator-log-undo';
       undoBtn.textContent = 'undo';
-      undoBtn.addEventListener('click', () => undoCuratorExpire(entry.before.id, undoBtn));
+      undoBtn.addEventListener('click', () => undoCuratorAction(entry.before.id, entry.action, undoBtn));
       row.appendChild(undoBtn);
     }
 
@@ -883,12 +886,12 @@ function renderCuratorLogList(entries, container) {
   });
 }
 
-async function undoCuratorExpire(memoryId, btn) {
+async function undoCuratorAction(memoryId, action, btn) {
   if (btn) { btn.disabled = true; btn.textContent = '…'; }
   try {
     const res = await fetch(`${window.location.origin}/api/memory/curation-log/undo`, {
       method: 'POST',
-      body: new URLSearchParams({ memory_id: memoryId })
+      body: new URLSearchParams({ memory_id: memoryId, action: action })
     });
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));

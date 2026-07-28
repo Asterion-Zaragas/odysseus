@@ -162,6 +162,26 @@ class MemoryVectorStore:
         out.sort(key=lambda row: (-row["score"], lane_priority.get(row["embedding_lane"], 99)))
         return dedupe_results(out, id_key="memory_id", limit=k)
 
+    def text_similarity(self, a: str, b: str) -> Optional[float]:
+        """Cosine similarity between two raw strings, independent of the
+        index — used as a fidelity guard (e.g. the curator's reword pass),
+        not for retrieval. None if the embedding lane isn't healthy or the
+        embed call fails, so callers can distinguish "no signal" from a
+        real low score."""
+        if not self._healthy:
+            return None
+        try:
+            vecs = self._embed([a, b])
+            if len(vecs) != 2:
+                return None
+            import numpy as np
+            v1, v2 = np.array(vecs[0]), np.array(vecs[1])
+            denom = (np.linalg.norm(v1) * np.linalg.norm(v2)) or 1e-9
+            return float(np.dot(v1, v2) / denom)
+        except Exception as e:
+            logger.warning("text_similarity failed: %s", e)
+            return None
+
     def find_similar(self, text: str, threshold: float = 0.92) -> Optional[str]:
         """Check if a near-duplicate exists. Returns memory_id if found, else None."""
         if not self._healthy or self.count() == 0:

@@ -200,6 +200,14 @@ DEFAULT_SETTINGS = {
     # human clears it from the Curator tab. See memory_curator.py's module
     # docstring for the retry -> bisect -> quarantine escalation.
     "memory_curator_quarantine_after": 3,
+    # Reword pass (grammar/clarity wording pass, gated separately from the
+    # general dry-run soak switch above since it's the only curator pass
+    # that mutates `text` itself): off by default. The optional second-model
+    # judge is an extra layer, not a replacement for the code-level
+    # similarity/numbers-preserved guards (see memory_curator.py's reword
+    # section), so it defaults off too.
+    "memory_curator_reword_enabled": False,
+    "memory_curator_reword_judge_enabled": False,
     "teacher_model": "",
     "teacher_enabled": False,
     "teacher_tier2_enabled": False,

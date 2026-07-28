@@ -409,12 +409,14 @@ async def test_curate_persists_each_pass_so_a_later_crash_keeps_earlier_work(_is
         # Triage ran and was persisted before the crash: generality is set and
         # the provisional tag was promoted, despite curate() never reaching its
         # final save. The checkpoint sits at the last pass that completed, so a
-        # resume skips triage/dedupe without losing their work.
+        # resume skips triage/dedupe/reword without losing their work.
         stored = mgr.load(owner="alice")
         assert stored[0]["generality"] == 2
         assert "drinks" in stored[0]["tags"]
         assert stored[0]["provisional_tags"] == []
-        assert cur._load_checkpoint("alice")["last_completed_pass"] == "tag_normalize"
+        # reword is disabled by default (memory_curator_reword_enabled=False),
+        # so it's still the pass immediately before rescore in PASS_ORDER.
+        assert cur._load_checkpoint("alice")["last_completed_pass"] == "reword"
 
 
 # ── failure-aware fingerprint gating + force run ──

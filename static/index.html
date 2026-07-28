@@ -1642,6 +1642,14 @@
                 <label class="settings-label" title="If a single memory keeps failing the same curator pass on its own (after in-run retries and splitting the batch down to just that entry) across this many separate curator runs, it's quarantined from that pass until you clear it from the Curator tab.">Quarantine after (failed runs)</label>
                 <input id="set-memoryQuarantineAfter" type="text" inputmode="numeric" placeholder="3" class="settings-select" style="width:382.5px;flex:0 0 auto;margin-left:auto;">
               </div>
+              <div class="settings-row">
+                <label class="settings-label" title="Let the curator lightly improve entry wording (grammar, redundancy, clarity) — never facts/names/numbers/dates. Off by default: this is the only curator pass that rewrites text itself, guarded by a similarity floor + numbers-preserved check.">Reword entries (wording pass)</label>
+                <span style="margin-left:auto;"><label class="admin-switch" title="Let the curator lightly improve entry wording. Off by default."><input type="checkbox" id="set-memoryRewordToggle"><span class="admin-slider"></span></label></span>
+              </div>
+              <div class="settings-row">
+                <label class="settings-label" title="Have a second LLM call verify a proposed reword preserves every fact before it's applied, on top of the always-on similarity/numbers-preserved code guards. Off by default — reuses the same model as the reword proposal.">Reword judge (second opinion)</label>
+                <span style="margin-left:auto;"><label class="admin-switch" title="Extra LLM verification pass for reword proposals. Off by default."><input type="checkbox" id="set-memoryRewordJudgeToggle"><span class="admin-slider"></span></label></span>
+              </div>
               <div id="set-memorySystemMsg" style="font-size:11px;color:color-mix(in srgb, var(--fg) 45%, transparent);"></div>
             </div>
           </div>

@@ -5,8 +5,10 @@ Nightly, per-owner curator agent ("memory smart" role): the second half of
 the memory upgrade's agentic lifecycle (the tagger, in memory_tagger.py,
 handles on-demand tagging at write time). The curator never touches the
 hot path — it backfills tags on entries the tagger never saw, dedupes/
-merges, normalizes tags, rescores tiers, expires stale archive entries, and
-rebuilds the per-owner context document (services/memory/memory_context.py).
+merges, normalizes tags, optionally lightly rewords entries for clarity
+(gated, off by default — see the reword pass below), rescores tiers,
+expires stale archive entries, and rebuilds the per-owner context document
+(services/memory/memory_context.py).
 
 Batching discipline: the curator NEVER puts a whole store in one prompt —
 every LLM sub-pass runs many small sequential calls of at most
@@ -16,8 +18,8 @@ is skipped, never aborts the run (`_tag_backfill_batch` / `_triage_batch` /
 `_dedupe_batch` / `_propose_tag_merges` all degrade to "no-op for this
 batch" on any LLM/parse failure).
 
-Resilience escalation for the three entry-batched passes (tag_backfill,
-triage, dedupe; `_run_pass_resilient`): since `cluster_batches` is fully
+Resilience escalation for the entry-batched passes (tag_backfill, triage,
+dedupe, reword; `_run_pass_resilient`): since `cluster_batches` is fully
 deterministic given
 unchanged content, a batch that fails would otherwise fail *identically*
 every single future run. Three cheapest-first layers:
@@ -36,12 +38,15 @@ every single future run. Three cheapest-first layers:
      pass's batches until a human clears it (Curator tab) — a backstop so a
      chronically-bad entry doesn't burn LLM calls forever while blocking
      itself from ever being triaged/deduped.
-Deliberately NOT bisected/quarantined: dedupe's `>50% removed` safety-guard
-refusal (`unsafe_removal_refused`) is a considered judgment the model made
-correctly, not a parse/format failure — shrinking the batch until it drops
-below `_UNSAFE_REMOVAL_MIN_BATCH` would silently defeat the guard rather than
-fix anything, so that reason is never retried, bisected, or quarantined; the
-whole batch is left unchanged exactly as before this feature existed.
+Deliberately NOT retried/bisected by this layer (`_TERMINAL_REFUSAL_REASONS`):
+dedupe's `>50% removed` safety-guard refusal (`unsafe_removal_refused`) and
+reword's per-entry fidelity/judge guard refusal (`reword_refused`) are both
+considered judgments the code made correctly, not a parse/format failure —
+shrinking the batch would silently defeat the guard rather than fix
+anything, so neither reason is ever retried or bisected here. dedupe leaves
+the whole batch unchanged; reword instead quarantines each refused entry
+directly (see `_refuse_reword`), since unlike dedupe's batch-level refusal
+it's a per-entry outcome, not all-or-nothing.
 `llm_error` (the call itself raised — timeout/network/API error) IS retried
 (transient failures are exactly what a retry is for) but never bisected — a
 dead/slow endpoint fails at any batch size, so shrinking it just multiplies
@@ -68,6 +73,7 @@ import copy
 import json
 import logging
 import os
+import re
 import time
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -87,6 +93,7 @@ CURATION_STATE_DIR = os.path.join(DATA_DIR, "memory_curation_state")
 CURATION_LOG_DIR = os.path.join(DATA_DIR, "memory_curation_log")
 CURATION_FAILURES_DIR = os.path.join(DATA_DIR, "memory_curation_failures")
 TAG_BACKFILL_STATE_DIR = os.path.join(DATA_DIR, "memory_tag_backfill_state")
+REWORD_STATE_DIR = os.path.join(DATA_DIR, "memory_reword_state")
 
 # Pass order for a full curation run. Checkpointing is at pass granularity:
 # a crash/shutdown mid-run resumes at the next NOT-yet-completed pass rather
@@ -96,8 +103,10 @@ TAG_BACKFILL_STATE_DIR = os.path.join(DATA_DIR, "memory_tag_backfill_state")
 # tag normalization pulls them into the same cluster on a later run.
 # tag_backfill runs first so any tags it proposes are visible to triage's
 # provisional-tag promotion and to dedupe/tag_normalize's clustering in the
-# same run, rather than waiting for tomorrow night.
-PASS_ORDER = ("tag_backfill", "triage", "dedupe", "tag_normalize", "rescore", "expire", "context_doc")
+# same run, rather than waiting for tomorrow night. reword runs after
+# dedupe/tag_normalize — no point rewording an entry about to be merged
+# away, and context_doc's core-facts summary should see the final wording.
+PASS_ORDER = ("tag_backfill", "triage", "dedupe", "tag_normalize", "reword", "rescore", "expire", "context_doc")
 
 DEFAULT_PROTECTED_TAGS = ("contact", "identity")
 
@@ -228,6 +237,41 @@ def undo_expire(memory_manager, memory_vector, owner: Optional[str], memory_id: 
             logger.warning("undo_expire: vector re-add failed for %s: %s", memory_id, e)
 
     _log_action(owner, "undo_expire", before=None, after=snapshot)
+    return True
+
+
+def undo_reword(memory_manager, owner: Optional[str], memory_id: str) -> bool:
+    """Reverse a `reword` action by restoring the pre-reword text from the
+    changelog snapshot. Scoped to `text` only — tags/tier are left as-is (a
+    reworded-then-undone entry could in theory leave tags derived from the
+    newer wording slightly stale; out of scope for v1).
+
+    Returns True if a snapshot was found and the entry's text now matches it
+    (either just restored, or already matching — a safe no-op). Does not
+    touch the vector index; a stale embedding self-heals at the next
+    non-dry-run `curate()`'s unconditional `rebuild()`, same as every other
+    curator mutation.
+    """
+    snapshot_text = None
+    for rec in reversed(read_curation_log(owner, limit=0, include_dry_run=False)):
+        before = rec.get("before")
+        if rec.get("action") == "reword" and isinstance(before, dict) and before.get("id") == memory_id:
+            snapshot_text = before.get("text")
+            break
+    if snapshot_text is None:
+        return False
+
+    with memory_manager.lock:
+        entries = memory_manager.load_all()
+        entry = next((e for e in entries if e.get("id") == memory_id), None)
+        if entry is None:
+            return False
+        if entry.get("text") == snapshot_text:
+            return True
+        entry["text"] = snapshot_text
+        memory_manager.save(entries)
+
+    _log_action(owner, "undo_reword", before=None, after={"id": memory_id, "text": snapshot_text})
     return True
 
 
@@ -433,6 +477,46 @@ def _mark_backfilled(owner: Optional[str], ids: Set[str]) -> None:
     os.replace(tmp, path)
 
 
+# ---- "already evaluated" sidecar for the reword pass ----
+#
+# Same shape/rationale as the tag_backfill sidecar above: an id -> True map
+# marking entries this pass has evaluated (proposed-and-applied, or
+# proposed-nothing). A *guard refusal* is deliberately NOT marked done — see
+# `_reword_batch` — so it keeps being reconsidered on future runs.
+
+def _reword_state_path(owner: Optional[str]) -> str:
+    return os.path.join(REWORD_STATE_DIR, f"{_owner_slug(owner)}.json")
+
+
+def _reworded_ids(owner: Optional[str]) -> Set[str]:
+    try:
+        with open(_reword_state_path(owner), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return set(data.keys()) if isinstance(data, dict) else set()
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return set()
+
+
+def _mark_reworded(owner: Optional[str], ids: Set[str]) -> None:
+    if not ids:
+        return
+    os.makedirs(REWORD_STATE_DIR, exist_ok=True)
+    path = _reword_state_path(owner)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            data = {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        data = {}
+    for entry_id in ids:
+        data[entry_id] = True
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+    os.replace(tmp, path)
+
+
 # In-run retry attempts beyond the first, same batch/content — cheap, catches
 # ordinary model flakiness. Bisection only kicks in once these are exhausted.
 _BATCH_RETRY_ATTEMPTS = 2
@@ -440,18 +524,24 @@ _BISECT_MIN_SIZE = 1
 # Only a parse failure is plausibly content-correlated enough to bisect; see
 # module docstring for why llm_error and unsafe_removal_refused are excluded.
 _BISECTABLE_REASONS = {"non_json_reply"}
+# Reasons that represent a considered code-level judgment, not a parse/format
+# failure — never retried within a run (retrying would just reproduce the
+# same refusal). dedupe's batch-level `>50% removed` guard was first;
+# reword's per-entry fidelity/judge guard reuses the same treatment.
+_TERMINAL_REFUSAL_REASONS = {"unsafe_removal_refused", "reword_refused"}
 
 
 def _classify_reason(local_failures: List[str]) -> Optional[str]:
     """`local_failures` entries look like '<pass>:llm_error:<detail>',
-    '<pass>:non_json_reply', or '<pass>:unsafe_removal_refused' (the only
-    strings `_tag_backfill_batch`/`_triage_batch`/`_dedupe_batch` ever
-    append) — returns just the category, or None if nothing was appended (a
-    legitimate no-op result)."""
+    '<pass>:non_json_reply', '<pass>:unsafe_removal_refused', or
+    '<pass>:reword_refused' (the only strings `_tag_backfill_batch`/
+    `_triage_batch`/`_dedupe_batch`/`_reword_batch` ever append) — returns
+    just the category, or None if nothing was appended (a legitimate no-op
+    result)."""
     if not local_failures:
         return None
     last = local_failures[-1]
-    for cat in ("non_json_reply", "unsafe_removal_refused", "llm_error"):
+    for cat in ("non_json_reply", "unsafe_removal_refused", "reword_refused", "llm_error"):
         if cat in last:
             return cat
     return "unknown"
@@ -479,7 +569,7 @@ async def _run_pass_resilient(
         reason = _classify_reason(local)
         if reason is None:
             return value
-        if reason == "unsafe_removal_refused":
+        if reason in _TERMINAL_REFUSAL_REASONS:
             break  # a considered judgment, not a transient/content glitch — never retried
 
     if reason in _BISECTABLE_REASONS and len(batch) > _BISECT_MIN_SIZE:
@@ -1138,6 +1228,261 @@ async def _run_tag_normalize_pass(
     return entries
 
 
+# ---- Pass 3.5: reword (wording optimization) ----
+#
+# Gated behind its own `memory_curator_reword_enabled` setting (default
+# False) — even an install that's already turned off the general
+# `memory_curator_dry_run` soak mode doesn't get real text mutations from
+# this pass until it's opted in separately, since `text` is the actual fact
+# content everything else (retrieval, dedup, the user-facing memory page)
+# depends on. This is the highest-blast-radius curator pass: the primary
+# defense is deterministic code (a cosine-similarity floor + a numbers/dates
+# invariant check), not "ask another model" — see
+# .AGENT_CONTEXT/plans/2026-07-28-curator-reword-pass.md's design-decision
+# note. An optional second-model judge layer exists but is off by default
+# and never the sole guard.
+#
+# Unlike dedupe, the model here DOES rewrite text — but only ever text this
+# pass itself proposes and the code guards below verify, never blind.
+
+REWORD_SYSTEM_PROMPT = (
+    "You may lightly improve the wording of personal memory entries — fix "
+    "grammar, remove redundancy, improve clarity. You must NOT add, remove, "
+    "or change any fact, name, number, date, or meaning. If an entry needs "
+    "no improvement, omit it from your reply entirely.\n\n"
+    "Return a JSON array of {\"id\": ..., \"text\": \"...\"} — ONLY for "
+    "entries you are actually changing. Return ONLY valid JSON, no markdown "
+    "fences, no commentary."
+)
+
+REWORD_MAX_TOKENS = 4096
+
+# Trivial one-liners have no room to improve and no reason to carry the
+# (small) rewrite risk.
+_MIN_REWORD_LEN = 40
+
+# Not a setting (matches `_UNSAFE_REMOVAL_MIN_BATCH`'s precedent) — this is
+# the floor, not a tunable knob a misconfiguration could silently widen.
+# Tighter than `find_similar`'s 0.92 near-duplicate threshold, which serves
+# a different purpose (dedup) and isn't directly comparable.
+_REWORD_MIN_SIMILARITY = 0.90
+
+# Numbers/dates only, not a general NER pass — the highest-damage failure
+# mode (a changed phone number, birthday, address digit, dollar amount) is
+# exactly what this catches deterministically. Proper-noun preservation is
+# too noisy to gate on with a heuristic and is left to the optional judge.
+_NUM_RE = re.compile(r"\d[\d,.:/-]*\d|\d")
+
+
+def _numbers_preserved(original: str, reworded: str) -> bool:
+    return set(_NUM_RE.findall(original)) <= set(_NUM_RE.findall(reworded))
+
+
+def _needs_reword(entry: Dict, done_ids: Set[str]) -> bool:
+    return (
+        entry.get("id") not in done_ids
+        and entry.get("tier") != TIER_ARCHIVE  # about to expire, not worth it
+        and len(entry.get("text", "")) >= _MIN_REWORD_LEN
+    )
+
+
+REWORD_JUDGE_SYSTEM_PROMPT = (
+    "You are verifying that a reworded personal-memory entry preserves every "
+    "fact from the original with no additions, omissions, or changes — only "
+    "wording (grammar, redundancy, clarity) may differ.\n\n"
+    "Input: a JSON array of {id, original, reworded}.\n"
+    "Output: a JSON array of {\"id\": ..., \"preserved\": true|false} — "
+    "EXACTLY one object per input id. Return ONLY valid JSON, no markdown "
+    "fences, no commentary."
+)
+
+REWORD_JUDGE_MAX_TOKENS = 1024
+
+
+async def _judge_reword_batch(
+    triples: List[Tuple[Dict, str, str]], owner: Optional[str], interactive: bool = False,
+) -> Dict[str, bool]:
+    """Batched second-opinion check (`memory_curator_reword_judge_enabled`,
+    off by default). Fail-closed: an LLM error, a non-JSON reply, or an id
+    simply missing from the reply all mean "not verified" — the caller
+    treats a missing id as `preserved=False`, same as an explicit false."""
+    from src.task_endpoint import memory_llm_call_async
+
+    payload = [{"id": entry["id"], "original": old, "reworded": new} for entry, old, new in triples]
+    messages = [
+        {"role": "system", "content": REWORD_JUDGE_SYSTEM_PROMPT},
+        _user_message(payload, "Return ONLY the JSON array, nothing else."),
+    ]
+    try:
+        raw = await memory_llm_call_async(
+            "smart", messages, owner=owner, interactive=interactive,
+            temperature=0.1, max_tokens=REWORD_JUDGE_MAX_TOKENS,
+            response_format=_JSON_MODE,
+        )
+    except Exception as e:
+        logger.warning("Curator reword judge failed for owner=%r: %s", owner, e)
+        return {}
+
+    results = _parse_json_array(raw)
+    if not results:
+        return {}
+
+    out: Dict[str, bool] = {}
+    for item in results:
+        if not isinstance(item, dict) or item.get("id") is None:
+            continue
+        out[item["id"]] = bool(item.get("preserved"))
+    return out
+
+
+def _refuse_reword(
+    owner: Optional[str], entry: Dict, old_text: str, reason: str, dry_run: bool,
+    actions: List[Tuple[str, Dict, Dict]],
+) -> None:
+    """A guard rejection is a considered judgment by the code, not a parse/
+    format failure — leaves the entry unchanged, logs `reword_refused`
+    (with the reason, for the Curator tab), and bumps its quarantine
+    counter directly (this pass is never bisected, so the resilience
+    layer's own bisect-leaf quarantine call never fires for it)."""
+    actions.append(("reword_refused", {"id": entry.get("id"), "text": old_text, "reason": reason}, None))
+    _handle_quarantine_candidate(owner, "reword", entry, "reword_refused", dry_run)
+
+
+async def _reword_batch(
+    batch: List[Dict], owner: Optional[str], memory_vector, judge_enabled: bool,
+    interactive: bool, dry_run: bool, failures: Optional[List[str]] = None,
+) -> Tuple[List[Tuple[str, Dict, Dict]], Set[str]]:
+    """Mutates entries in `batch` in place; returns (changelog actions, ids
+    that were fully evaluated this call). An entry lands in the returned id
+    set whether it was applied or the model proposed nothing for it — both
+    are legitimate outcomes. An entry the model proposed a rewrite for that
+    then failed a guard is deliberately left OUT of that set (see
+    `_refuse_reword`) so it's reconsidered next run, not left unscanned only
+    because of an LLM/parse failure (which instead scans nothing at all, so
+    the whole batch retries — same contract as the other batched passes)."""
+    from src.task_endpoint import memory_llm_call_async
+
+    payload = [{"id": e["id"], "text": e.get("text", "")} for e in batch]
+    messages = [
+        {"role": "system", "content": REWORD_SYSTEM_PROMPT},
+        _user_message(payload, "Return ONLY the JSON array, nothing else."),
+    ]
+    try:
+        raw = await memory_llm_call_async(
+            "smart", messages, owner=owner, interactive=interactive,
+            temperature=0.1, max_tokens=REWORD_MAX_TOKENS, timeout=120,
+            response_format=_JSON_MODE,
+        )
+    except Exception as e:
+        logger.warning("Curator reword batch failed for owner=%r: %s", owner, e)
+        if failures is not None:
+            failures.append(f"reword:llm_error:{e}")
+        return [], set()
+
+    results = _parse_json_array(raw)
+    if results is None:
+        if failures is not None:
+            failures.append("reword:non_json_reply")
+        return [], set()
+
+    by_id = {e["id"]: e for e in batch}
+    proposed: Dict[str, str] = {}
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        entry = by_id.get(item.get("id"))
+        new_text = item.get("text")
+        if entry is None or not isinstance(new_text, str) or not new_text.strip():
+            continue
+        proposed[entry["id"]] = new_text.strip()
+
+    actions: List[Tuple[str, Dict, Dict]] = []
+    scanned: Set[str] = set()
+    passed_code_guard: List[Tuple[Dict, str, str]] = []
+    any_refused = False
+
+    for entry in batch:
+        entry_id = entry["id"]
+        new_text = proposed.get(entry_id)
+        old_text = entry.get("text", "")
+        if new_text is None or new_text == old_text:
+            scanned.add(entry_id)  # nothing (usefully) proposed = no change
+            continue
+
+        similarity = None
+        if memory_vector is not None:
+            try:
+                similarity = memory_vector.text_similarity(old_text, new_text)
+            except Exception as e:
+                logger.warning("Curator reword similarity check failed for %s: %s", entry_id, e)
+
+        if similarity is None:
+            _refuse_reword(owner, entry, old_text, "vector store unavailable — cannot verify fidelity", dry_run, actions)
+            any_refused = True
+        elif similarity < _REWORD_MIN_SIMILARITY:
+            _refuse_reword(owner, entry, old_text, f"similarity {similarity:.3f} below floor {_REWORD_MIN_SIMILARITY}", dry_run, actions)
+            any_refused = True
+        elif not _numbers_preserved(old_text, new_text):
+            _refuse_reword(owner, entry, old_text, "a number or date was not preserved", dry_run, actions)
+            any_refused = True
+        else:
+            passed_code_guard.append((entry, old_text, new_text))
+
+    if passed_code_guard and judge_enabled:
+        judged = await _judge_reword_batch(passed_code_guard, owner, interactive)
+    else:
+        judged = {entry["id"]: True for entry, _, _ in passed_code_guard}
+
+    for entry, old_text, new_text in passed_code_guard:
+        entry_id = entry["id"]
+        if not judged.get(entry_id, False):
+            _refuse_reword(owner, entry, old_text, "judge did not confirm fidelity", dry_run, actions)
+            any_refused = True
+            continue
+        before = copy.deepcopy(entry)
+        entry["text"] = new_text
+        actions.append(("reword", before, copy.deepcopy(entry)))
+        scanned.add(entry_id)
+
+    if any_refused and failures is not None:
+        failures.append("reword:reword_refused")
+
+    return actions, scanned
+
+
+async def _run_reword_pass(
+    entries: List[Dict], owner: Optional[str], batch_size: int, dry_run: bool, memory_vector,
+    interactive: bool = False, failures: Optional[List[str]] = None,
+) -> List[Dict]:
+    from src.settings import get_setting
+
+    if not bool(get_setting("memory_curator_reword_enabled", False)):
+        return entries
+    judge_enabled = bool(get_setting("memory_curator_reword_judge_enabled", False))
+
+    quarantined = _quarantined_ids(_load_failure_state(owner), "reword")
+    done_ids = _reworded_ids(owner)
+    pending = [e for e in entries if _needs_reword(e, done_ids) and e.get("id") not in quarantined]
+
+    async def call_batch(sub_batch: List[Dict], local_failures: List[str]) -> Tuple[List[Tuple[str, Dict, Dict]], Set[str]]:
+        return await _reword_batch(sub_batch, owner, memory_vector, judge_enabled, interactive, dry_run, local_failures)
+
+    def combine(a, b):
+        return (a[0] + b[0], a[1] | b[1])
+
+    newly_scanned: Set[str] = set()
+    for batch in cluster_batches(pending, batch_size):
+        actions, scanned = await _run_pass_resilient(batch, call_batch, combine, owner, "reword", dry_run, failures)
+        for action, before, after in actions:
+            _log_action(owner, action, before=before, after=after, dry_run=dry_run)
+        newly_scanned |= scanned
+
+    if not dry_run and newly_scanned:
+        _mark_reworded(owner, newly_scanned)
+
+    return entries
+
+
 # ---- Pass 4: re-scoring (pure code) ----
 
 def _run_rescore_pass(entries: List[Dict], owner: Optional[str], dry_run: bool) -> List[Dict]:
@@ -1338,6 +1683,8 @@ async def curate(
             entries = await _run_dedupe_pass(entries, owner, batch_size, dry_run, interactive, failures)
         elif pass_name == "tag_normalize":
             entries = await _run_tag_normalize_pass(entries, owner, cap, protected, dry_run, interactive, failures)
+        elif pass_name == "reword":
+            entries = await _run_reword_pass(entries, owner, batch_size, dry_run, memory_vector, interactive, failures)
         elif pass_name == "rescore":
             entries = _run_rescore_pass(entries, owner, dry_run)
         elif pass_name == "expire":

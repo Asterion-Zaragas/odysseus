@@ -27,7 +27,7 @@ from src.memory import compat_category, normalize_tags
 from src.request_models import MemoryAddRequest
 from core.database import SessionLocal
 from src.llm_core import llm_call_async
-from services.memory.memory_curator import curate, read_curation_log, undo_expire, clear_quarantine, list_quarantined
+from services.memory.memory_curator import curate, read_curation_log, undo_expire, undo_reword, clear_quarantine, list_quarantined
 from services.memory.memory_context import MemoryContext
 from src.auth_helpers import get_current_user, require_user
 from src.endpoint_resolver import resolve_endpoint
@@ -381,19 +381,28 @@ def setup_memory_routes(memory_manager: MemoryManager, session_manager: SessionM
         }
 
     @router.post("/curation-log/undo")
-    def undo_curation_action(request: Request, memory_id: str = Form(...)):
-        """Undo an `expire` action by re-inserting its changelog snapshot."""
+    def undo_curation_action(request: Request, memory_id: str = Form(...), action: str = Form("expire")):
+        """Undo a curator changelog action by re-applying its snapshot.
+        `action="expire"` (default, preserves existing callers) restores a
+        deleted entry; `action="reword"` restores an entry's pre-reword
+        text."""
         from src.auth_helpers import require_privilege
         require_privilege(request, "can_manage_memory")
         user = _owner(request)
-        if not undo_expire(memory_manager, memory_vector, user, memory_id):
-            raise HTTPException(404, "No expired memory found with that id")
+        if action == "reword":
+            ok = undo_reword(memory_manager, user, memory_id)
+            not_found_detail = "No reworded memory found with that id"
+        else:
+            ok = undo_expire(memory_manager, memory_vector, user, memory_id)
+            not_found_detail = "No expired memory found with that id"
+        if not ok:
+            raise HTTPException(404, not_found_detail)
         return {"ok": True}
 
     @router.get("/quarantine")
     def get_quarantined_memories(request: Request):
         """Entries the curator has stopped feeding to a given pass
-        (tag_backfill/triage/dedupe) after `memory_curator_quarantine_after`
+        (tag_backfill/triage/dedupe/reword) after `memory_curator_quarantine_after`
         separate runs kept failing on that entry alone — see
         memory_curator.py's module docstring. Enriched with the entry's
         current text so the Curator tab

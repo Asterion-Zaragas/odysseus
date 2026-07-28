@@ -742,6 +742,8 @@ async function initMemorySystemSettings() {
   var expiryDaysInput = el('set-memoryExpiryDays');
   var protectedTagsInput = el('set-memoryProtectedTags');
   var quarantineAfterInput = el('set-memoryQuarantineAfter');
+  var rewordToggle = el('set-memoryRewordToggle');
+  var rewordJudgeToggle = el('set-memoryRewordJudgeToggle');
   var msg = el('set-memorySystemMsg');
   if (!registryCapInput) return;
 
@@ -760,6 +762,8 @@ async function initMemorySystemSettings() {
     if (settings.memory_archive_expiry_days != null) expiryDaysInput.value = settings.memory_archive_expiry_days;
     if (settings.memory_protected_tags != null) protectedTagsInput.value = settings.memory_protected_tags;
     if (quarantineAfterInput && settings.memory_curator_quarantine_after != null) quarantineAfterInput.value = settings.memory_curator_quarantine_after;
+    if (rewordToggle) rewordToggle.checked = !!settings.memory_curator_reword_enabled;
+    if (rewordJudgeToggle) rewordJudgeToggle.checked = !!settings.memory_curator_reword_judge_enabled;
   } catch (e) { console.warn('Failed to load memory system settings', e); }
 
   async function saveMemorySystem() {
@@ -788,6 +792,8 @@ async function initMemorySystemSettings() {
       var quarantineAfter = parseInt(quarantineAfterInput.value, 10);
       if (!isNaN(quarantineAfter)) payload.memory_curator_quarantine_after = quarantineAfter;
     }
+    if (rewordToggle) payload.memory_curator_reword_enabled = rewordToggle.checked;
+    if (rewordJudgeToggle) payload.memory_curator_reword_judge_enabled = rewordJudgeToggle.checked;
     try {
       await fetch('/api/auth/settings', { method: 'POST', credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json' },
@@ -798,7 +804,7 @@ async function initMemorySystemSettings() {
     } catch (e) { msg.textContent = 'Failed to save'; msg.style.color = 'var(--red)'; }
   }
 
-  [nightlyToggle, dryRunToggle, registryCapInput, curatorHourInput, curatorBatchInput, effortSelect, recallKInput, facetTimeoutInput, contextDocToggle, expiryDaysInput, protectedTagsInput]
+  [nightlyToggle, dryRunToggle, registryCapInput, curatorHourInput, curatorBatchInput, effortSelect, recallKInput, facetTimeoutInput, contextDocToggle, expiryDaysInput, protectedTagsInput, rewordToggle, rewordJudgeToggle]
     .forEach(function(input) { if (input) input.addEventListener('change', saveMemorySystem); });
 }
 
