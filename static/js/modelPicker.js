@@ -303,11 +303,6 @@ function _initModelPickerDropdown() {
           : mid;
         if (seen.has(seenKey)) return;
         seen.add(seenKey);
-        // Deduplicate by model ID — prefer ONLINE endpoint entries over
-        // offline duplicates so the user gets a working endpoint first
-        // when the same model is exposed by both.
-        if (seen.has(mid)) return;
-        seen.add(mid);
         const display = (allDisplay[i] || mid).split('/').pop();
         const filename = (allFilenames[i] || mid).split('/').pop();
         result.push({
