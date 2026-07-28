@@ -12,6 +12,7 @@ import time
 
 import pytest
 
+from services.memory import memory_context as mc
 from services.memory import memory_curator as cur
 from src.memory import MemoryManager
 
@@ -190,6 +191,8 @@ def _isolated_dirs(tmp_path, monkeypatch):
     monkeypatch.setattr(cur, "CURATION_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setattr(cur, "CURATION_LOG_DIR", str(tmp_path / "log"))
     monkeypatch.setattr(cur, "CURATION_FAILURES_DIR", str(tmp_path / "failures"))
+    monkeypatch.setattr(cur, "TAG_BACKFILL_STATE_DIR", str(tmp_path / "tag_backfill_state"))
+    monkeypatch.setattr(mc, "CONTEXT_DIR", str(tmp_path / "context"))
     return tmp_path
 
 

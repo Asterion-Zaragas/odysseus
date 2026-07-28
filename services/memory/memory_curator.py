@@ -4,20 +4,21 @@ memory_curator.py
 Nightly, per-owner curator agent ("memory smart" role): the second half of
 the memory upgrade's agentic lifecycle (the tagger, in memory_tagger.py,
 handles on-demand tagging at write time). The curator never touches the
-hot path — it dedupes/merges, normalizes tags, rescores tiers, expires
-stale archive entries, and rebuilds the per-owner context document
-(services/memory/memory_context.py).
+hot path — it backfills tags on entries the tagger never saw, dedupes/
+merges, normalizes tags, rescores tiers, expires stale archive entries, and
+rebuilds the per-owner context document (services/memory/memory_context.py).
 
 Batching discipline: the curator NEVER puts a whole store in one prompt —
 every LLM sub-pass runs many small sequential calls of at most
 `memory_curator_batch` entries (see `cluster_batches`), clustered by
 dominant tag so duplicates/synonyms land in the same batch. A failing batch
-is skipped, never aborts the run (`_triage_batch` / `_dedupe_batch` /
-`_propose_tag_merges` all degrade to "no-op for this batch" on any
-LLM/parse failure).
+is skipped, never aborts the run (`_tag_backfill_batch` / `_triage_batch` /
+`_dedupe_batch` / `_propose_tag_merges` all degrade to "no-op for this
+batch" on any LLM/parse failure).
 
-Resilience escalation for the two entry-batched passes (triage, dedupe;
-`_run_pass_resilient`): since `cluster_batches` is fully deterministic given
+Resilience escalation for the three entry-batched passes (tag_backfill,
+triage, dedupe; `_run_pass_resilient`): since `cluster_batches` is fully
+deterministic given
 unchanged content, a batch that fails would otherwise fail *identically*
 every single future run. Three cheapest-first layers:
   1. **In-run retry** — the same batch content is retried a couple of times
@@ -85,6 +86,7 @@ logger = logging.getLogger(__name__)
 CURATION_STATE_DIR = os.path.join(DATA_DIR, "memory_curation_state")
 CURATION_LOG_DIR = os.path.join(DATA_DIR, "memory_curation_log")
 CURATION_FAILURES_DIR = os.path.join(DATA_DIR, "memory_curation_failures")
+TAG_BACKFILL_STATE_DIR = os.path.join(DATA_DIR, "memory_tag_backfill_state")
 
 # Pass order for a full curation run. Checkpointing is at pass granularity:
 # a crash/shutdown mid-run resumes at the next NOT-yet-completed pass rather
@@ -92,7 +94,10 @@ CURATION_FAILURES_DIR = os.path.join(DATA_DIR, "memory_curation_failures")
 # so redoing one pass's batches on resume is cheap, and cross-batch effects
 # (e.g. a duplicate pair split across batches) are eventually caught once
 # tag normalization pulls them into the same cluster on a later run.
-PASS_ORDER = ("triage", "dedupe", "tag_normalize", "rescore", "expire", "context_doc")
+# tag_backfill runs first so any tags it proposes are visible to triage's
+# provisional-tag promotion and to dedupe/tag_normalize's clustering in the
+# same run, rather than waiting for tomorrow night.
+PASS_ORDER = ("tag_backfill", "triage", "dedupe", "tag_normalize", "rescore", "expire", "context_doc")
 
 DEFAULT_PROTECTED_TAGS = ("contact", "identity")
 
@@ -387,6 +392,47 @@ def list_quarantined(owner: Optional[str]) -> List[Dict]:
     return out
 
 
+# ---- "already scanned" sidecar for the tag_backfill pass ----
+#
+# Separate from the failure-state sidecar above: this one tracks *success*,
+# not failure. tag_backfill is a one-time-ever pass per entry (unlike
+# triage/dedupe, which re-visit an entry whenever its content changes), so a
+# plain id -> True map is enough. Same load/save-with-tmp-then-replace
+# pattern as `_load_failure_state`/`_save_failure_state`.
+
+def _tag_backfill_state_path(owner: Optional[str]) -> str:
+    return os.path.join(TAG_BACKFILL_STATE_DIR, f"{_owner_slug(owner)}.json")
+
+
+def _backfilled_ids(owner: Optional[str]) -> Set[str]:
+    try:
+        with open(_tag_backfill_state_path(owner), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return set(data.keys()) if isinstance(data, dict) else set()
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return set()
+
+
+def _mark_backfilled(owner: Optional[str], ids: Set[str]) -> None:
+    if not ids:
+        return
+    os.makedirs(TAG_BACKFILL_STATE_DIR, exist_ok=True)
+    path = _tag_backfill_state_path(owner)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            data = {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        data = {}
+    for entry_id in ids:
+        data[entry_id] = True
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+    os.replace(tmp, path)
+
+
 # In-run retry attempts beyond the first, same batch/content — cheap, catches
 # ordinary model flakiness. Bisection only kicks in once these are exhausted.
 _BATCH_RETRY_ATTEMPTS = 2
@@ -399,8 +445,9 @@ _BISECTABLE_REASONS = {"non_json_reply"}
 def _classify_reason(local_failures: List[str]) -> Optional[str]:
     """`local_failures` entries look like '<pass>:llm_error:<detail>',
     '<pass>:non_json_reply', or '<pass>:unsafe_removal_refused' (the only
-    strings `_triage_batch`/`_dedupe_batch` ever append) — returns just the
-    category, or None if nothing was appended (a legitimate no-op result)."""
+    strings `_tag_backfill_batch`/`_triage_batch`/`_dedupe_batch` ever
+    append) — returns just the category, or None if nothing was appended (a
+    legitimate no-op result)."""
     if not local_failures:
         return None
     last = local_failures[-1]
@@ -515,6 +562,147 @@ def _user_message(payload: object, reminder: str) -> Dict:
         "role": "user",
         "content": json.dumps(payload, ensure_ascii=False) + "\n\n" + reminder,
     }
+
+
+# ---- Pass 0: tag backfill ----
+#
+# Every *write* path (memory_tagger.tag_memory + apply_tags) tags a memory at
+# creation time, but nothing ever revisits an entry already sitting in the
+# store — an entry imported with only a flat legacy category tag (or one
+# whose tagger call failed at write time) keeps exactly those tags forever.
+# This pass proposes real, registry-aware tags for any entry the
+# `_backfilled_ids` sidecar hasn't seen yet, additive-only (it never removes
+# or replaces a tag an entry already has). Batched like triage/dedupe rather
+# than one call per entry (the write-time tagger's shape) because this pass
+# can potentially see the whole store at once on first deploy.
+
+TAG_BACKFILL_SYSTEM_PROMPT = (
+    "You tag existing memory entries for a personal memory system, using the "
+    "tag registry below. For EVERY input entry, propose tags describing it.\n\n"
+    "Return a JSON array of {\"id\": ..., \"tags\": [...], \"new_tags\": [...]}"
+    " — EXACTLY one object per input entry, reusing the SAME id. Omit an "
+    "entry from your reply only if you have genuinely nothing to add to its "
+    "existing tags.\n"
+    "\"tags\": tags chosen from the REGISTRY that apply and are not already "
+    "on the entry. \"new_tags\": tags you believe are needed but are NOT in "
+    "the registry (kebab-case; person:/place:/org:/project: prefixes for "
+    "named entities). tags + new_tags combined must not exceed 10 per entry. "
+    "Return ONLY valid JSON, no markdown fences, no commentary."
+)
+
+TAG_BACKFILL_MAX_TOKENS = 2048
+
+
+def _needs_tag_backfill(entry: Dict, done_ids: Set[str]) -> bool:
+    return entry.get("id") not in done_ids
+
+
+async def _tag_backfill_batch(
+    batch: List[Dict], owner: Optional[str], cap: int, interactive: bool = False,
+    failures: Optional[List[str]] = None,
+) -> Tuple[List[Tuple[str, Dict, Dict]], Set[str]]:
+    """Mutates entries in `batch` in place; returns (changelog actions, ids
+    that were successfully scanned this call). The scanned-ids set includes
+    every id in `batch` as long as the call's reply parsed, even ones the
+    model omitted from its reply (an omission means "nothing to add", a
+    legitimate outcome) — only a call that never produced usable JSON leaves
+    a batch's ids unscanned, so they're retried next run."""
+    from src.memory import normalize_tags
+    from src.task_endpoint import memory_llm_call_async
+    from services.memory.memory_context import MemoryContext
+
+    ctx = MemoryContext(owner)
+    registry_names = ctx.registry_names()
+    registry_excerpt = ctx.registry_excerpt(max_tags=cap)
+
+    payload = {
+        "registry": registry_excerpt,
+        "entries": [
+            {"id": e["id"], "text": e.get("text", ""), "tags": e.get("tags") or []}
+            for e in batch
+        ],
+    }
+    messages = [
+        {"role": "system", "content": TAG_BACKFILL_SYSTEM_PROMPT},
+        _user_message(payload, "Return ONLY the JSON array, nothing else."),
+    ]
+    try:
+        raw = await memory_llm_call_async(
+            "smart", messages, owner=owner, interactive=interactive,
+            temperature=0.1, max_tokens=TAG_BACKFILL_MAX_TOKENS,
+            response_format=_JSON_MODE,
+        )
+    except Exception as e:
+        logger.warning("Curator tag_backfill batch failed for owner=%r: %s", owner, e)
+        if failures is not None:
+            failures.append(f"tag_backfill:llm_error:{e}")
+        return [], set()
+
+    results = _parse_json_array(raw)
+    if results is None:
+        if failures is not None:
+            failures.append("tag_backfill:non_json_reply")
+        return [], set()
+
+    by_id = {e["id"]: e for e in batch}
+    actions: List[Tuple[str, Dict, Dict]] = []
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        entry = by_id.get(item.get("id"))
+        if entry is None:
+            continue
+        before = copy.deepcopy(entry)
+
+        proposed = normalize_tags(list(item.get("tags") or []) + list(item.get("new_tags") or []))
+        existing_tags = set(entry.get("tags") or [])
+        existing_provisional = set(entry.get("provisional_tags") or [])
+        if registry_names:
+            new_real = [t for t in proposed if t in registry_names and t not in existing_tags]
+            new_provisional = [t for t in proposed if t not in registry_names and t not in existing_provisional]
+        else:
+            # Cold start (empty registry): nothing to validate proposals
+            # against, so everything lands provisional — same contract as
+            # tag_memory's own cold-start behavior.
+            new_real = []
+            new_provisional = [t for t in proposed if t not in existing_provisional]
+
+        if new_real:
+            entry["tags"] = normalize_tags(list(entry.get("tags") or []) + new_real)
+        if new_provisional:
+            entry["provisional_tags"] = normalize_tags(list(entry.get("provisional_tags") or []) + new_provisional)
+
+        if entry != before:
+            actions.append(("tag_backfill", before, copy.deepcopy(entry)))
+
+    return actions, {e["id"] for e in batch}
+
+
+async def _run_tag_backfill_pass(
+    entries: List[Dict], owner: Optional[str], batch_size: int, cap: int, dry_run: bool, interactive: bool = False,
+    failures: Optional[List[str]] = None,
+) -> List[Dict]:
+    quarantined = _quarantined_ids(_load_failure_state(owner), "tag_backfill")
+    done_ids = _backfilled_ids(owner)
+    pending = [e for e in entries if _needs_tag_backfill(e, done_ids) and e.get("id") not in quarantined]
+
+    async def call_batch(sub_batch: List[Dict], local_failures: List[str]) -> Tuple[List[Tuple[str, Dict, Dict]], Set[str]]:
+        return await _tag_backfill_batch(sub_batch, owner, cap, interactive, local_failures)
+
+    def combine(a, b):
+        return (a[0] + b[0], a[1] | b[1])
+
+    newly_scanned: Set[str] = set()
+    for batch in cluster_batches(pending, batch_size):
+        actions, scanned = await _run_pass_resilient(batch, call_batch, combine, owner, "tag_backfill", dry_run, failures)
+        for action, before, after in actions:
+            _log_action(owner, action, before=before, after=after, dry_run=dry_run)
+        newly_scanned |= scanned
+
+    if not dry_run and newly_scanned:
+        _mark_backfilled(owner, newly_scanned)
+
+    return entries
 
 
 # ---- Pass 1: triage ----
@@ -1075,9 +1263,10 @@ async def curate(
     """Run the full curator pipeline for one owner.
 
     Never raises: a per-batch LLM failure degrades that batch to a no-op
-    (see `_triage_batch` / `_dedupe_batch` / `_propose_tag_merges`); this
-    function itself can still raise on genuine programming errors, but no
-    LLM/network failure should propagate past it. Every such failure (and
+    (see `_tag_backfill_batch` / `_triage_batch` / `_dedupe_batch` /
+    `_propose_tag_merges`); this function itself can still raise on genuine
+    programming errors, but no LLM/network failure should propagate past
+    it. Every such failure (and
     the `>50% removed` dedupe safety refusal) is recorded in a `failures`
     list threaded through the passes; if that list is non-empty at the end
     of a live run, the tidy-fingerprint save is skipped so a future run
@@ -1141,7 +1330,9 @@ async def curate(
     entries = [copy.deepcopy(e) for e in existing]
     for idx in range(start_idx, len(PASS_ORDER)):
         pass_name = PASS_ORDER[idx]
-        if pass_name == "triage":
+        if pass_name == "tag_backfill":
+            entries = await _run_tag_backfill_pass(entries, owner, batch_size, cap, dry_run, interactive, failures)
+        elif pass_name == "triage":
             entries = await _run_triage_pass(entries, owner, batch_size, dry_run, interactive, failures)
         elif pass_name == "dedupe":
             entries = await _run_dedupe_pass(entries, owner, batch_size, dry_run, interactive, failures)

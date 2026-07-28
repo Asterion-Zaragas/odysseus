@@ -392,10 +392,11 @@ def setup_memory_routes(memory_manager: MemoryManager, session_manager: SessionM
 
     @router.get("/quarantine")
     def get_quarantined_memories(request: Request):
-        """Entries the curator has stopped feeding to a given pass (triage/
-        dedupe) after `memory_curator_quarantine_after` separate runs kept
-        failing on that entry alone — see memory_curator.py's module
-        docstring. Enriched with the entry's current text so the Curator tab
+        """Entries the curator has stopped feeding to a given pass
+        (tag_backfill/triage/dedupe) after `memory_curator_quarantine_after`
+        separate runs kept failing on that entry alone — see
+        memory_curator.py's module docstring. Enriched with the entry's
+        current text so the Curator tab
         can show something more useful than a bare id."""
         user = _owner(request)
         quarantined = list_quarantined(user)
