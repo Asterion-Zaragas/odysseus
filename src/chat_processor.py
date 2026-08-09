@@ -50,6 +50,43 @@ def _clean_search_query(query: str, max_len: int = 200) -> str:
     return text[:max_len]
 
 
+# Vocabulary from the query-extraction system prompt. If it comes back out of
+# the model, the model restated its instructions instead of following them.
+_QUERY_ECHO_MARKERS = (
+    "search query",
+    "user message:",
+    "reply only",
+    "goal:",
+    "constraint:",
+)
+
+
+def _is_plausible_search_query(generated: str, message: str) -> bool:
+    """Return True if ``generated`` looks like an extracted query, not an echo.
+
+    The extraction step in ``build_context_preface`` asks a model to distil a
+    search query from the user's message, and previously accepted any non-empty
+    reply. Weaker instruct models routinely paraphrase the task instead
+    ("User message: "..." * Goal: Extract a concise search query. * Constraint:
+    Reply ONLY"), which was then truncated to 150 chars and sent to SearXNG
+    verbatim — producing results unrelated to anything the user asked, and
+    long enough that some engines answered 403.
+
+    Two cheap signals, either of which sends us back to the first-line
+    fallback: the reply is longer than the message it supposedly summarises,
+    or it contains the extraction prompt's own vocabulary.
+    """
+    q = generated.strip()
+    if not q:
+        return False
+    # A distilled query is never longer than its source. The floor keeps short
+    # messages ("berlin?") from rejecting a reasonable expansion.
+    if len(q) > max(len(message), 80):
+        return False
+    lowered = q.lower()
+    return not any(marker in lowered for marker in _QUERY_ECHO_MARKERS)
+
+
 class ChatProcessor:
     def __init__(self, memory_manager, personal_docs_manager, memory_vector=None, skills_manager=None):
         self.memory_manager = memory_manager
@@ -331,12 +368,19 @@ class ChatProcessor:
                         timeout=15,
                     ).strip()
 
-                    if generated_query:
-                        # LLM successfully generated a non-empty query -> use the generated query
-                        search_query = generated_query
-                    else:
+                    if not generated_query:
                         # LLM returned an empty or whitespace-only query -> fall back to original query
                         logger.warning("LLM generated an empty search query, using fallback.")
+                    elif _is_plausible_search_query(generated_query, message):
+                        # LLM successfully generated a usable query -> use it
+                        search_query = generated_query
+                    else:
+                        # LLM restated its instructions instead of extracting a
+                        # query; searching that returns nonsense, so fall back.
+                        logger.warning(
+                            "LLM query extraction echoed the prompt instead of a query (%r), using fallback.",
+                            generated_query[:120],
+                        )
                 except Exception as e:
                     # LLM failed (exception/error) -> fall back to original user query
                     logger.warning(f"Failed to generate search query via LLM, using fallback: {e}")
