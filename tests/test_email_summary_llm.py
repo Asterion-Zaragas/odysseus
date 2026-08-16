@@ -125,7 +125,17 @@ async def test_scheduled_email_summary_uses_background_fallback_chain(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_scheduled_local_summary_is_preempted_by_foreground_call(monkeypatch):
+async def test_scheduled_local_summary_is_not_cancelled_by_foreground_call(monkeypatch):
+    """A foreground call defers new background work but never kills an in-flight one.
+
+    Upstream's gate cancelled the running background call outright. That is
+    deliberately not the behaviour here: cancelling mid-generation lost whatever
+    batch the nightly curator was part-way through, and it deadlocked inline
+    memory LLM calls that are themselves issued from a tracked request. The gate
+    now *pauses* — the in-flight generation finishes, the foreground caller
+    queues behind it on the lock, and newly-arriving background work waits on
+    ``_LOCAL_MODEL_WAITING_FOREGROUND``.
+    """
     import routes.email_helpers as email_helpers
     import src.llm_core as llm_core
     import src.task_endpoint as task_endpoint
@@ -182,9 +192,24 @@ async def test_scheduled_local_summary_is_preempted_by_foreground_call(monkeypat
                 return True
 
         foreground_task = asyncio.create_task(run_foreground())
-        with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(background_task, timeout=1)
+        # Let the foreground caller reach the lock and register its interest.
+        for _ in range(10):
+            await asyncio.sleep(0)
+
+        # The in-flight background call survives...
+        assert not background_task.done(), \
+            "in-flight background call must not be cancelled by a foreground request"
+        # ...the foreground caller is queued behind it, not running...
+        assert not foreground_task.done(), \
+            "foreground must queue on the lock while background holds the slot"
+        # ...and its waiting mark is what makes NEW background work defer.
+        assert llm_core._LOCAL_MODEL_WAITING_FOREGROUND == 1
+
+        # Background finishes its generation of its own accord and releases.
+        never_release.set()
+        await asyncio.wait_for(background_task, timeout=1)
         assert await asyncio.wait_for(foreground_task, timeout=1) is True
+        assert llm_core._LOCAL_MODEL_WAITING_FOREGROUND == 0
         assert observed_workloads == ["background"]
     finally:
         for task in (background_task, foreground_task):

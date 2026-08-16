@@ -13,9 +13,17 @@ SRC = (Path(__file__).resolve().parent.parent / "static/js/modelPicker.js").read
 
 
 def test_dropdown_item_has_title_tooltip():
-    # The dropdown item name span must carry a title with the full display name.
-    assert re.search(r"nameSpan\.title\s*=\s*m\.display", SRC), \
+    # The dropdown item name span must carry a title tooltip whose first line is
+    # the full display name. The row itself is one line and too narrow to also
+    # show the raw filename and endpoint alongside a friendly name, so this
+    # branch builds the tooltip from `_tooltipLines` (display name first, then
+    # optional "File:"/"Endpoint:" detail) rather than assigning `m.display`
+    # directly as upstream does. The #1982 guarantee — hovering reveals the full
+    # name — is what matters here, not the exact expression.
+    assert re.search(r"nameSpan\.title\s*=\s*_tooltipLines\.join\(", SRC), \
         "dropdown model-name span needs a title tooltip (#1982)"
+    assert re.search(r"const\s+_tooltipLines\s*=\s*\[\s*m\.display\s*\]", SRC), \
+        "the tooltip's first line must be the full model display name (#1982)"
 
 
 def test_header_indicator_has_title_tooltip():
