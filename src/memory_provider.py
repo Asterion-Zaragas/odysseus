@@ -167,10 +167,13 @@ class NativeMemoryProvider(MemoryProvider):
         if metadata:
             entry["metadata"] = dict(metadata)
 
-        with self.memory_manager.lock:
-            memories = self.memory_manager.load_all()
+        # `updating` holds the lock across load-append-save and loads strictly:
+        # `load_all` would degrade an unreadable store to [] and save this one
+        # entry over everything already stored (issue #5673). The provider API
+        # has no error channel, so MemoryStoreUnreadable propagates to the
+        # caller.
+        with self.memory_manager.updating() as memories:
             memories.append(entry)
-            self.memory_manager.save(memories)
 
         if self._vector_available():
             self.memory_vector.add(entry["id"], entry["text"])
@@ -234,8 +237,13 @@ class NativeMemoryProvider(MemoryProvider):
         ]
 
     async def delete(self, memory_id: str, *, owner: Optional[str] = None) -> bool:
+        # Not `updating()`: the "nothing matched" path returns without saving,
+        # and the list handed to save() is `remaining`, not the loaded one.
+        # Strict load for the same reason as add(): `remaining` is derived from
+        # this list and saved back, so it must never be built from a store we
+        # failed to read.
         with self.memory_manager.lock:
-            memories = self.memory_manager.load_all()
+            memories = self.memory_manager.load_all_for_update()
             remaining = []
             deleted_id = None
 

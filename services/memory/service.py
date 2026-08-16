@@ -3,12 +3,15 @@
 
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Any
+import logging
 import os
 
-from .memory import MemoryManager
+from .memory import MemoryManager, MemoryStoreUnreadable
 from .memory_vector import MemoryVectorStore
 from src.memory_provider import MemoryRecord, NativeMemoryProvider
 from src.constants import DATA_DIR
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -115,7 +118,12 @@ class MemoryService:
 
     def delete(self, memory_id: str) -> bool:
         """Delete a memory by ID."""
-        memories = self.manager.load_all()
+        # Strict load: `remaining` is derived from this list and saved back.
+        try:
+            memories = self.manager.load_all_for_update()
+        except MemoryStoreUnreadable as e:
+            logger.info("Skipping delete, memory store unreadable: %s", e)
+            return False
         remaining = [m for m in memories if m.get("id") != memory_id]
         if len(remaining) == len(memories):
             return False

@@ -6,10 +6,23 @@ import threading
 import time
 import uuid
 import re
+from contextlib import contextmanager
 from typing import List, Dict, Optional, Tuple
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
+
+
+class MemoryStoreUnreadable(RuntimeError):
+    """memory.json exists on disk but could not be read or parsed.
+
+    "The contents are unknown" is categorically different from "there are no
+    memories". A read-modify-write caller that conflates the two appends to an
+    empty view and then persists it, destroying the whole store — the writes
+    are atomic, so the loss is durable. Raised by
+    :meth:`MemoryManager.load_all_for_update` so those callers fail closed.
+    """
+
 
 # ── Tags ──
 # Memories carry free-form facet tags (max MAX_TAGS, normalized kebab-case).
@@ -100,10 +113,36 @@ class MemoryManager:
         # Guards load-modify-save sequences. Saves are atomic (os.replace) but
         # not transactional: the tagger, the curator, and increment_uses all
         # mutate the same file, and an unguarded concurrent RMW loses writes.
-        # Everything runs in one process, so an RLock is enough; hold it around
-        # any load→mutate→save block (external callers use `with mm.lock:`).
+        # Everything runs in one process, so an RLock is enough.
+        #
+        # Every method here that touches the file takes this lock itself, so a
+        # single call is always safe on its own. A read-modify-write spans two
+        # calls (load then save) and internal locking CANNOT make that atomic —
+        # use :meth:`updating`, which holds the lock across the whole cycle.
+        # `self.lock` stays public for callers that need to span more than one
+        # store operation; it is reentrant, so nesting it is safe.
         self.lock = threading.RLock()
         self.ensure_file_exists()
+
+    @contextmanager
+    def updating(self):
+        """Atomic read-modify-write over the whole store.
+
+        Holds the lock across load→mutate→save and loads strictly, so the block
+        never runs against a degraded view of an unreadable store::
+
+            with mm.updating() as entries:
+                entries.append(new_entry)
+
+        Saves on clean exit; an exception inside the block propagates and
+        nothing is written. Raises :class:`MemoryStoreUnreadable` if the store
+        could not be read — background callers that would rather skip than fail
+        should catch it and log, request handlers should turn it into a 503.
+        """
+        with self.lock:
+            entries = self.load_all_for_update()
+            yield entries
+            self.save(entries)
         
     def extract_memory_from_chat(self, chat_history: List[Dict], session_id: str = None) -> List[Dict]:
         """
@@ -174,25 +213,82 @@ class MemoryManager:
     
     def ensure_file_exists(self):
         """Create memory file if it doesn't exist."""
-        if not os.path.exists(self.memory_file):
-            with open(self.memory_file, 'w', encoding='utf-8') as f:
-                json.dump([], f, ensure_ascii=False, indent=2)
-    
-    def load_all(self) -> List[Dict]:
-        """Load all memory entries from JSON file (unfiltered)."""
+        with self.lock:
+            if not os.path.exists(self.memory_file):
+                with open(self.memory_file, 'w', encoding='utf-8') as f:
+                    json.dump([], f, ensure_ascii=False, indent=2)
+
+    def _read_entries(self) -> List[Dict]:
+        """Parse the store, or raise :class:`MemoryStoreUnreadable`.
+
+        Returns ``[]`` only when the file genuinely does not exist. Every other
+        failure mode raises, so callers can tell "no memories" apart from
+        "couldn't read the memories".
+
+        Takes the lock so a read can never observe a half-finished write; the
+        lock is reentrant, so callers already holding it (``updating``) nest
+        harmlessly.
+        """
+        with self.lock:
+            return self._read_entries_locked()
+
+    def _read_entries_locked(self) -> List[Dict]:
         if not os.path.exists(self.memory_file):
             return []
 
         try:
             with open(self.memory_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                if isinstance(data, list):
-                    return self._validate_entries(data)
-        except (json.JSONDecodeError, PermissionError) as e:
-            logger.error("Error loading memory.json: %s", e)
-            return self._migrate_from_legacy()
+        except OSError as e:
+            # PermissionError is an OSError (a scanner holding the file, a
+            # permissions problem, bad media).
+            raise MemoryStoreUnreadable(
+                f"cannot read {self.memory_file}: {e}"
+            ) from e
+        except json.JSONDecodeError as e:
+            # This is the branch that actually destroyed stores: the file reads
+            # back fine, so nothing stops the save that follows. A truncated
+            # memory.json is reachable because core/database.py rewrites it with
+            # a plain open(..,"w") + json.dump during migration.
+            #
+            # Preserved behaviour: a corrupt store still gets one shot at the
+            # pre-JSON memory.txt migration. Only raise when that finds nothing,
+            # so we never report "empty" for a store we simply failed to parse.
+            legacy = self._migrate_from_legacy()
+            if legacy:
+                return legacy
+            raise MemoryStoreUnreadable(
+                f"{self.memory_file} is not valid JSON: {e}"
+            ) from e
 
-        return []
+        if not isinstance(data, list):
+            raise MemoryStoreUnreadable(
+                f"{self.memory_file} is not a JSON array (got {type(data).__name__})"
+            )
+        return self._validate_entries(data)
+
+    def load_all(self) -> List[Dict]:
+        """Load all memory entries from JSON file (unfiltered).
+
+        Lenient by design: this feeds display, search, and context-injection
+        paths, so an unreadable store degrades to an empty list rather than
+        breaking chat. Never build a value from this that you intend to save
+        back — use :meth:`load_all_for_update` for that.
+        """
+        try:
+            return self._read_entries()
+        except MemoryStoreUnreadable as e:
+            logger.error("Error loading memory.json: %s", e)
+            return []
+
+    def load_all_for_update(self) -> List[Dict]:
+        """Load for a read-modify-write cycle.
+
+        Propagates :class:`MemoryStoreUnreadable` instead of degrading to ``[]``
+        so a caller can never append to an empty view and persist it over a
+        store that was only temporarily unreadable (issue #5673).
+        """
+        return self._read_entries()
 
     def load(self, owner: str = None) -> List[Dict]:
         """Load memory entries, optionally filtered by owner."""
@@ -204,7 +300,12 @@ class MemoryManager:
     def claim_ownerless(self, owner: str):
         """Assign all ownerless memory entries to the given owner."""
         with self.lock:
-            entries = self.load_all()
+            try:
+                entries = self.load_all_for_update()
+            except MemoryStoreUnreadable as e:
+                # Skip the sweep rather than rewrite the store from an unknown view.
+                logger.info("Skipping ownerless claim, memory store unreadable: %s", e)
+                return
             changed = False
             claimed = 0
             for entry in entries:
@@ -288,8 +389,8 @@ class MemoryManager:
 
     def add_entry(self, text: str, source: str = "user", tags: List[str] = None,
                   owner: str = None, category: str = None) -> Dict:
-        """Build a new memory entry (not persisted — append + save yourself,
-        holding `self.lock` around the load-append-save).
+        """Build a new memory entry (not persisted — append it inside a
+        :meth:`updating` block, which holds the lock across load-append-save).
 
         `category` is a deprecated alias kept for old callers/imports; its
         value is folded into `tags`.
@@ -326,11 +427,18 @@ class MemoryManager:
         id_set = set(ids)
         now = int(time.time())
         with self.lock:
-            entries = self.load_all()
+            try:
+                entries = self.load_all_for_update()
+            except MemoryStoreUnreadable as e:
+                # Best-effort counter; never worth rewriting the store blind.
+                logger.info("Skipping uses bump, memory store unreadable: %s", e)
+                return
             changed = False
             for e in entries:
                 if e.get("id") in id_set:
                     e["uses"] = int(e.get("uses", 0) or 0) + 1
+                    # Drives tier_scoring.recency_decay() and the curator's
+                    # archive-expiry pass — not just a display field.
                     e["last_used_at"] = now
                     changed = True
             if changed:

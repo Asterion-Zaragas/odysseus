@@ -360,7 +360,10 @@ class ChatProcessor:
                         )
                         if len(rag_content) > 10000:
                             rag_content = rag_content[:10000] + "\n[Truncated]"
-                        preface.append(untrusted_context_message("retrieved documents", rag_content))
+                        preface.append(untrusted_context_message(
+                            "retrieved documents",
+                            rag_content,
+                        ))
             except Exception as e:
                 logger.warning(f"RAG retrieval failed: {e}")
 
@@ -451,6 +454,7 @@ class ChatProcessor:
                     preface.append(untrusted_context_message(
                         f"web page: {url}",
                         f"Content from {url}:\n\n{content}",
+                        provenance_origin="external",
                     ))
 
         # Skills index — progressive disclosure. Only injected when the
@@ -474,6 +478,9 @@ class ChatProcessor:
                     for s in sorted(by_cat[cat], key=lambda x: x["name"]):
                         desc = s.get("description") or ""
                         lines.append(f"    - {s['name']}: {desc}" if desc else f"    - {s['name']}")
-                preface.append(untrusted_context_message("available skills index", "\n".join(lines)))
+                preface.append(untrusted_context_message(
+                    "available skills index",
+                    "\n".join(lines),
+                ))
 
         return preface, rag_sources, web_sources

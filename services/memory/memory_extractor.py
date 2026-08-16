@@ -20,6 +20,8 @@ import logging
 import re
 from typing import Optional
 
+from src.memory import MemoryStoreUnreadable
+
 logger = logging.getLogger(__name__)
 
 
@@ -418,7 +420,14 @@ async def extract_and_store(
             logger.info("Auto memory extraction ran: 0 candidates")
             return
 
-        existing = memory_manager.load_all()
+        # Strict load: this is a read-modify-write. Degrading to [] here would
+        # save only the newly extracted facts and drop the entire store.
+        # Background path — skip the pass rather than surface an error.
+        try:
+            existing = memory_manager.load_all_for_update()
+        except MemoryStoreUnreadable as e:
+            logger.info("Skipping auto memory extraction, store unreadable: %s", e)
+            return
         added = 0
         new_entries = []
 
@@ -507,7 +516,13 @@ async def extract_and_store(
 
         if added > 0:
             with memory_manager.lock:
-                fresh = memory_manager.load_all()
+                # Strict load: appending to a degraded [] would persist only the
+                # newly extracted entries over the whole store.
+                try:
+                    fresh = memory_manager.load_all_for_update()
+                except MemoryStoreUnreadable as e:
+                    logger.info("Skipping extraction save, store unreadable: %s", e)
+                    return
                 fresh.extend(new_entries)
                 memory_manager.save(fresh)
             try:
@@ -531,3 +546,200 @@ async def extract_and_store(
     except Exception as e:
         logger.error(f"Memory extraction failed: {e}")
 
+
+# ── DORMANT: not wired to anything on this branch ──────────────────────────
+# `audit_memories` is upstream's memory-audit pass. On feature/agentic_memory
+# it is SUPERSEDED by services/memory/memory_curator.py: the extraction
+# threshold above calls `triage_new_entries`, and the /api/memory/audit route
+# calls `curate()`. Nothing in this tree calls the function below.
+#
+# It is kept verbatim, and deliberately unwired, so upstream's future changes
+# to it keep applying cleanly and stay attributable. Do NOT "fix", refactor, or
+# re-point it at the curator — if it looks broken or dead, that is expected.
+# Retire it only by deciding to drop upstream's version outright.
+# ───────────────────────────────────────────────────────────────────────────
+
+async def audit_memories(
+    memory_manager,
+    memory_vector,
+    endpoint_url: str,
+    model: str,
+    headers: Optional[dict] = None,
+    owner: Optional[str] = None,
+):
+    """Send all memories to the LLM for deduplication and consolidation.
+
+    - Merges near-duplicate entries
+    - Rewrites vague entries to be concise
+    - Removes junk / non-personal entries
+    - Rebuilds the vector index afterwards
+
+    Safe to call manually or from the automatic trigger in extract_and_store.
+    Errors are logged, never raised.
+    """
+    try:
+        from src.llm_core import llm_call_async
+
+        existing = memory_manager.load(owner=owner)
+        if not existing:
+            logger.info("Memory audit: nothing to audit")
+            return {"before": 0, "after": 0}
+
+        before_count = len(existing)
+
+        # Skip the LLM call entirely when this exact set of memories was
+        # already audited — the previous tidy left them in a clean state
+        # and nothing has changed since. Returns instantly so the UI shows
+        # "Already clean" without spending 30-120s on a wasted LLM round.
+        # The fingerprint includes id+text+category; any add/edit/delete
+        # invalidates it and the audit runs normally.
+        current_fp = _fingerprint_entries(existing)
+        last_state = _load_tidy_state(memory_manager).get(owner or "") or {}
+        if last_state.get("fingerprint") == current_fp:
+            logger.info("Memory audit: state unchanged since last tidy — skipping LLM")
+            return {
+                "before": before_count,
+                "after": before_count,
+                "already_tidy": True,
+            }
+
+        # Build payload: list of {id, text, category} for the LLM
+        memory_payload = [
+            {"id": m["id"], "text": m["text"], "category": m.get("category", "fact")}
+            for m in existing
+        ]
+
+        audit_messages = [
+            {"role": "system", "content": AUDIT_SYSTEM_PROMPT},
+            {"role": "user", "content": json.dumps(memory_payload, ensure_ascii=False)},
+        ]
+
+        raw = await llm_call_async(
+            endpoint_url,
+            model,
+            audit_messages,
+            temperature=0.1,
+            # 16384 (was 2000): the deduped list of all memories can be large,
+            # and a reasoning model spends tokens thinking first — 2000 truncated
+            # the JSON so it never parsed ("bad_json").
+            max_tokens=16384,
+            headers=headers,
+            # Bound the call so the Tidy whirlpool can't spin indefinitely on a
+            # slow/large generation.
+            timeout=120,
+        )
+
+        # Parse the JSON list, tolerating reasoning-model noise: <think> blocks,
+        # markdown fences, leading prose, and trailing commas.
+        import re as _re
+        text = (raw or "").strip()
+        text = _re.sub(r'<think(?:ing)?>[\s\S]*?</think(?:ing)?>', '', text, flags=_re.I).strip()
+
+        def _loads_list(s):
+            if not s:
+                return None
+            for cand in (s, _re.sub(r',(\s*[}\]])', r'\1', s)):
+                try:
+                    v = json.loads(cand)
+                    if isinstance(v, list):
+                        return v
+                except Exception:
+                    continue
+            return None
+
+        cleaned = _loads_list(text)
+        if cleaned is None:
+            _m = _re.search(r'```(?:json)?\s*\n?([\s\S]*?)```', text)
+            if _m:
+                cleaned = _loads_list(_m.group(1).strip())
+        if cleaned is None:
+            _a, _b = text.find('['), text.rfind(']')
+            if _a >= 0 and _b > _a:
+                cleaned = _loads_list(text[_a:_b + 1])
+        if cleaned is None:
+            logger.error(f"Memory audit returned non-JSON: {text[:300]}")
+            return {"before": before_count, "after": before_count, "error": "bad_json"}
+
+        # Build lookup of original entries by ID so we can preserve metadata
+        originals = {m["id"]: m for m in existing}
+
+        final_entries = []
+        for item in cleaned:
+            if not isinstance(item, dict):
+                continue
+            mid = item.get("id", "")
+            new_text = item.get("text", "").strip()
+            if not new_text:
+                continue
+
+            if mid in originals:
+                # Preserve original metadata, update text + category
+                entry = originals[mid].copy()
+                entry["text"] = new_text
+                if item.get("category"):
+                    entry["category"] = item["category"]
+            else:
+                # ID not found — skip to avoid inventing entries
+                logger.debug(f"Audit returned unknown id {mid}, skipping")
+                continue
+
+            final_entries.append(entry)
+
+        after_count = len(final_entries)
+
+        # Safety net against catastrophic over-deletion. A conservative tidy
+        # should never wipe out half the store in one pass — if the model
+        # returned far fewer entries than it was given (over-consolidation, a
+        # dropped/truncated list, or it ignored ids), treat it as a misfire and
+        # DON'T save. Better to no-op than to silently lose memories.
+        if before_count >= 8 and after_count < before_count * 0.5:
+            logger.warning(
+                f"Memory audit would cut {before_count} -> {after_count} "
+                f"(>50% removed) — refusing as unsafe, keeping originals"
+            )
+            return {"before": before_count, "after": before_count, "error": "unsafe_removal"}
+
+        # Merge audited entries back with other users' entries
+        if owner:
+            # Strict load: the merge below reconstructs the whole file. If this
+            # degraded to [] we would save only this owner's audited slice and
+            # destroy every other tenant's memories.
+            try:
+                all_entries = memory_manager.load_all_for_update()
+            except MemoryStoreUnreadable as e:
+                logger.error("Aborting memory audit save, store unreadable: %s", e)
+                return {
+                    "before": before_count,
+                    "after": before_count,
+                    "error": "store_unreadable",
+                }
+            audited_ids = {e["id"] for e in final_entries}
+            other_entries = [e for e in all_entries if e.get("owner") != owner and (e.get("owner") is not None)]
+            # Also keep legacy entries that weren't part of this audit
+            for e in all_entries:
+                if e.get("owner") is None and e["id"] not in audited_ids and e["id"] not in {o["id"] for o in other_entries}:
+                    other_entries.append(e)
+            saved_entries = final_entries + other_entries
+        else:
+            saved_entries = final_entries
+        memory_manager.save(saved_entries)
+        logger.info(
+            f"Memory audit complete: {before_count} -> {after_count} entries "
+            f"({before_count - after_count} removed/merged)"
+        )
+
+        # Rebuild vector index from the full saved set, not just this owner's
+        # slice — otherwise the shared collection is wiped of every other
+        # owner's entries until they happen to run their own audit.
+        if memory_vector and memory_vector.healthy:
+            memory_vector.rebuild(saved_entries)
+
+        # Persist the post-tidy fingerprint so the next call short-circuits
+        # if nothing has changed in the meantime.
+        _save_tidy_state(memory_manager, owner, _fingerprint_entries(final_entries))
+
+        return {"before": before_count, "after": after_count}
+
+    except Exception as e:
+        logger.error(f"Memory audit failed: {e}")
+        return {"error": str(e)}

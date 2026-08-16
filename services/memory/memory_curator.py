@@ -77,6 +77,7 @@ import re
 import time
 from typing import Dict, List, Optional, Set, Tuple
 
+from src.memory import MemoryStoreUnreadable
 from src.constants import DATA_DIR
 from services.memory.memory_context import _owner_slug
 from services.memory.memory_extractor import _fingerprint_entries
@@ -224,7 +225,11 @@ def undo_expire(memory_manager, memory_vector, owner: Optional[str], memory_id: 
         return False
 
     with memory_manager.lock:
-        entries = memory_manager.load_all()
+        try:
+            entries = memory_manager.load_all_for_update()
+        except MemoryStoreUnreadable as e:
+            logger.info("Skipping expire-undo, memory store unreadable: %s", e)
+            return False
         if any(e.get("id") == memory_id for e in entries):
             return True
         entries.append(copy.deepcopy(snapshot))
@@ -262,7 +267,11 @@ def undo_reword(memory_manager, owner: Optional[str], memory_id: str) -> bool:
         return False
 
     with memory_manager.lock:
-        entries = memory_manager.load_all()
+        try:
+            entries = memory_manager.load_all_for_update()
+        except MemoryStoreUnreadable as e:
+            logger.info("Skipping reword-undo, memory store unreadable: %s", e)
+            return False
         entry = next((e for e in entries if e.get("id") == memory_id), None)
         if entry is None:
             return False
@@ -1633,7 +1642,11 @@ async def curate(
     """
     from src.settings import get_setting
 
-    all_entries = memory_manager.load_all()
+    try:
+        all_entries = memory_manager.load_all_for_update()
+    except MemoryStoreUnreadable as e:
+        logger.info("Skipping triage pass, memory store unreadable: %s", e)
+        return {"triaged": 0}
     existing = _entries_for_owner(all_entries, owner)
     own_ids = {e["id"] for e in existing}
     before_count = len(existing)
@@ -1667,7 +1680,11 @@ async def curate(
         save. Reloads fresh under the lock every time so concurrent writers
         aren't clobbered."""
         with memory_manager.lock:
-            fresh_all = memory_manager.load_all()
+            # Strict load: `others` is saved back verbatim. A degraded [] here
+            # would persist ONLY this owner's working set, wiping every other
+            # owner's memories. Raise rather than skip — a silent no-op would
+            # look like a completed pass and advance the checkpoint.
+            fresh_all = memory_manager.load_all_for_update()
             others = [e for e in fresh_all if e["id"] not in own_ids]
             memory_manager.save(current_entries + others)
 
@@ -1707,10 +1724,24 @@ async def curate(
 
     if not dry_run:
         _clear_checkpoint(owner)
+        others = None
         with memory_manager.lock:
-            fresh_all = memory_manager.load_all()
-            others = [e for e in fresh_all if e["id"] not in own_ids]
-        if memory_vector is not None and getattr(memory_vector, "healthy", False):
+            # Strict load: `others` seeds a full vector rebuild. Degrading to []
+            # would rebuild the index from this owner's entries alone, dropping
+            # every other owner from search until the next successful run.
+            try:
+                fresh_all = memory_manager.load_all_for_update()
+            except MemoryStoreUnreadable as e:
+                logger.info(
+                    "Skipping curator vector rebuild, memory store unreadable: %s", e
+                )
+            else:
+                others = [e for e in fresh_all if e["id"] not in own_ids]
+        if (
+            others is not None
+            and memory_vector is not None
+            and getattr(memory_vector, "healthy", False)
+        ):
             try:
                 memory_vector.rebuild(entries + others)
             except Exception as e:
@@ -1741,7 +1772,11 @@ async def triage_new_entries(memory_manager, owner: Optional[str] = None) -> Dic
     expiry, and the context-doc rebuild stay nightly-only (full `curate`)."""
     from src.settings import get_setting
 
-    all_entries = memory_manager.load_all()
+    try:
+        all_entries = memory_manager.load_all_for_update()
+    except MemoryStoreUnreadable as e:
+        logger.info("Skipping triage pass, memory store unreadable: %s", e)
+        return {"triaged": 0}
     existing = _entries_for_owner(all_entries, owner)
     quarantined = _quarantined_ids(_load_failure_state(owner), "triage")
     pending = [copy.deepcopy(e) for e in existing if _needs_triage(e) and e.get("id") not in quarantined]
@@ -1756,7 +1791,8 @@ async def triage_new_entries(memory_manager, owner: Optional[str] = None) -> Dic
             _log_action(owner, action, before=before, after=after, dry_run=False)
 
     with memory_manager.lock:
-        fresh_all = memory_manager.load_all()
+        # Strict load for the same cross-owner reason as `_persist` above.
+        fresh_all = memory_manager.load_all_for_update()
         others = [e for e in fresh_all if e["id"] not in pending_ids]
         memory_manager.save(pending + others)
 

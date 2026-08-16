@@ -46,10 +46,12 @@ _ENDPOINT_SETTING_FIELDS = {
 }
 
 _ENDPOINT_FALLBACK_FIELDS = {
-    "default_model_fallbacks": "Default Model Fallbacks",
+    "foreground_model_fallbacks": "Foreground Model Fallbacks",
     "utility_model_fallbacks": "Utility Model Fallbacks",
     "vision_model_fallbacks":  "Vision Model Fallbacks",
 }
+# `default_model_fallbacks` is intentionally absent. The legacy data remains
+# stored as-is even when an endpoint is removed, but no longer affects routing.
 
 
 def _speech_settings_using_endpoint(settings: dict, ep_id: str) -> list:
@@ -179,7 +181,12 @@ def _clear_user_pref_endpoint_refs(all_prefs: dict, ep_id: str) -> int:
     if not isinstance(all_prefs, dict):
         return 0
     users = all_prefs.get("_users")
-    pref_sets = users.values() if isinstance(users, dict) else [all_prefs]
+    # A mixed store can contain auth-disabled foreground policy at the root
+    # alongside named-owner preferences. Both are active namespaces; legacy
+    # `default_model_fallbacks` remains untouched by the field allowlist.
+    pref_sets = [all_prefs]
+    if isinstance(users, dict):
+        pref_sets.extend(users.values())
     cleared_users = 0
     for prefs in pref_sets:
         if isinstance(prefs, dict) and _clear_endpoint_settings_for_endpoint(prefs, ep_id):
@@ -2561,7 +2568,13 @@ def setup_model_routes(model_discovery):
             # Accept either "pinned" or "pinned_models" for the manual IDs list.
             if "pinned_models" in body or "pinned" in body:
                 pinned = _normalize_model_ids(body.get("pinned_models", body.get("pinned")))
-                ep.pinned_models = json.dumps(pinned) if pinned else None
+                base = _normalize_base(ep.base_url)
+                kind = _effective_endpoint_kind(ep, base)
+                if _picker_requires_pinning(base, kind):
+                    ep.pinned_models = json.dumps(pinned)
+                    ep.hidden_models = None
+                else:
+                    ep.pinned_models = json.dumps(pinned) if pinned else None
             if "labels" in body:
                 incoming_labels = body.get("labels")
                 if not isinstance(incoming_labels, dict):
@@ -2632,12 +2645,9 @@ def setup_model_routes(model_discovery):
                     ep_id = settings.get("default_endpoint_id", "")
                 if not model:
                     model = settings.get("default_model", "")
-                if not _fallbacks:
-                    _fallbacks = settings.get("default_model_fallbacks") or []
         else:
             ep_id = settings.get("default_endpoint_id", "")
             model = settings.get("default_model", "")
-            _fallbacks = settings.get("default_model_fallbacks") or []
         db = SessionLocal()
         try:
             ep = None
@@ -2652,33 +2662,6 @@ def setup_model_routes(model_discovery):
                 if _user and not _is_admin:
                     ep_q = owner_filter(ep_q, ModelEndpoint, _user)
                 ep = ep_q.first()
-            # Configured fallback chain — when the chosen default endpoint is
-            # gone/disabled, honor the user's configured `default_model_fallbacks`
-            # in order BEFORE arbitrarily grabbing the first enabled endpoint.
-            # (Previously this jumped straight to "first enabled", which is why
-            # deleting/changing the main endpoint silently reassigned the default
-            # chat to some unrelated endpoint instead of the fallback.)
-            if not ep:
-                for entry in _fallbacks:
-                    if not isinstance(entry, dict):
-                        continue
-                    fid = (entry.get("endpoint_id") or "").strip()
-                    if not fid:
-                        continue
-                    cand_q = db.query(ModelEndpoint).filter(
-                        ModelEndpoint.id == fid, ModelEndpoint.is_enabled == True
-                    )
-                    if _user and not _is_admin:
-                        cand_q = owner_filter(cand_q, ModelEndpoint, _user)
-                    cand = cand_q.first()
-                    if cand:
-                        ep = cand
-                        # Use the fallback entry's model. Reset even when empty
-                        # so we don't carry the prior endpoint's stale model onto
-                        # this fallback — the cached-models lookup below then
-                        # fills it from the fallback endpoint.
-                        model = (entry.get("model") or "").strip()
-                        break
             # Last resort: first enabled endpoint owned by THIS user. Do not
             # include null-owner/shared endpoints here: a brand-new user with
             # no explicit default should not auto-open a pending chat using an

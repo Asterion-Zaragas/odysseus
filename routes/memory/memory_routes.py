@@ -21,7 +21,7 @@ def _strip_list_prefix(text: str) -> str:
         return text
     return _LIST_PREFIX_RE.sub("", text, count=1).strip()
 
-from services.memory import MemoryManager
+from services.memory import MemoryManager, MemoryStoreUnreadable
 from core.session_manager import SessionManager
 from src.memory import compat_category, normalize_tags
 from src.request_models import MemoryAddRequest
@@ -35,6 +35,22 @@ from src.task_endpoint import resolve_task_endpoint
 from src.upload_limits import read_upload_limited, MEMORY_IMPORT_MAX_BYTES
 
 logger = logging.getLogger(__name__)
+
+
+def _load_for_update(memory_manager) -> List[Dict[str, Any]]:
+    """Load the whole store for a read-modify-write cycle.
+
+    A transient read failure must not look like an empty store: the caller
+    would append to ``[]`` and save that back, atomically destroying every
+    existing memory (issue #5673). Surface it as a 503 and change nothing.
+    """
+    try:
+        return memory_manager.load_all_for_update()
+    except MemoryStoreUnreadable as e:
+        logger.error("Refusing to rewrite the memory store: %s", e)
+        raise HTTPException(
+            503, "Memory store is temporarily unreadable — no changes were made."
+        )
 
 
 def setup_memory_routes(memory_manager: MemoryManager, session_manager: SessionManager, memory_vector=None):
@@ -149,7 +165,7 @@ def setup_memory_routes(memory_manager: MemoryManager, session_manager: SessionM
         tag_result = await tag_memory(text, owner=user, interactive=True)
         apply_tags(new_entry, tag_result, user_tags=memory_data.tags)
         with memory_manager.lock:
-            all_mem = memory_manager.load_all()
+            all_mem = _load_for_update(memory_manager)
             all_mem.append(new_entry)
             memory_manager.save(all_mem)
         # Sync vector index
@@ -600,7 +616,7 @@ def setup_memory_routes(memory_manager: MemoryManager, session_manager: SessionM
         """Pin or unpin a memory. Pinned memories are always included in context."""
         user = _owner(request)
         with memory_manager.lock:
-            all_mem = memory_manager.load_all()
+            all_mem = _load_for_update(memory_manager)
             for i, memory in enumerate(all_mem):
                 if memory["id"] == memory_id:
                     _verify_memory_owner(memory, user)
@@ -637,7 +653,7 @@ def setup_memory_routes(memory_manager: MemoryManager, session_manager: SessionM
         user = _owner(request)
         explicit_tags: Optional[List[str]] = None
         with memory_manager.lock:
-            all_mem = memory_manager.load_all()
+            all_mem = _load_for_update(memory_manager)
             target = next((m for m in all_mem if m["id"] == memory_id), None)
             if not target:
                 raise HTTPException(404, f"Memory item {memory_id} not found")
@@ -665,7 +681,7 @@ def setup_memory_routes(memory_manager: MemoryManager, session_manager: SessionM
         from services.memory.memory_tagger import tag_memory, apply_tags
         tag_result = await tag_memory(new_text, owner=user, interactive=True)
         with memory_manager.lock:
-            all_mem = memory_manager.load_all()
+            all_mem = _load_for_update(memory_manager)
             target = next((m for m in all_mem if m["id"] == memory_id), None)
             if target:
                 apply_tags(target, tag_result, user_tags=explicit_tags)
@@ -682,7 +698,7 @@ def setup_memory_routes(memory_manager: MemoryManager, session_manager: SessionM
         """Delete a memory item by its ID."""
         user = _owner(request)
         with memory_manager.lock:
-            all_mem = memory_manager.load_all()
+            all_mem = _load_for_update(memory_manager)
 
             # Find and verify ownership before deleting
             target = next((m for m in all_mem if m["id"] == memory_id), None)

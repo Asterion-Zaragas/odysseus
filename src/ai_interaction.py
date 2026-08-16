@@ -22,6 +22,7 @@ import time
 from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
 
 from src.constants import GENERATED_IMAGES_DIR
+from src.memory import MemoryStoreUnreadable
 
 logger = logging.getLogger(__name__)
 
@@ -323,7 +324,10 @@ async def do_pipeline(content: str, session_id: Optional[str] = None, owner: Opt
         }
     except Exception as e:
         logger.error(f"pipeline failed at step {len(step_outputs) + 1}: {e}")
-        return {"error": f"Pipeline failed at step {len(step_outputs) + 1}: {e}"}
+        return {
+            "error": f"Pipeline failed at step {len(step_outputs) + 1}: {e}",
+            "untrusted_content": True,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -390,6 +394,8 @@ async def do_manage_memory(content: str, session_id: Optional[str] = None, owner
         if not text:
             return {"error": "Memory text cannot be empty"}
 
+        # No `category=`: the tagger owns categorisation on this branch — an
+        # explicit category arrives as `explicit_tags` and is applied below.
         entry = _memory_manager.add_entry(text, source="ai_agent", owner=owner)
         # interactive=True: this tool call runs inline inside the chat/agent
         # request's own tracked HTTP handling — waiting on interactive_gate's
@@ -397,10 +403,17 @@ async def do_manage_memory(content: str, session_id: Optional[str] = None, owner
         from services.memory.memory_tagger import tag_memory, apply_tags
         tag_result = await tag_memory(text, owner=owner, interactive=True)
         apply_tags(entry, tag_result, user_tags=explicit_tags)
-        with _memory_manager.lock:
-            memories = _memory_manager.load_all()
-            memories.append(entry)
-            _memory_manager.save(memories)
+        # Strict load: this is a read-modify-write, and it is the path an
+        # ordinary "remember that I prefer X" takes. Degrading to [] here would
+        # save just this one entry over a store we only failed to read,
+        # atomically destroying every memory in it (issue #5673). Surfaced to
+        # the model as a tool error so it can tell the user nothing was saved.
+        try:
+            with _memory_manager.updating() as memories:
+                memories.append(entry)
+        except MemoryStoreUnreadable as e:
+            logger.error("Refusing to add memory, store unreadable: %s", e)
+            return {"error": "Memory store is temporarily unreadable — nothing was saved."}
 
         # Update vector index if available
         if _memory_vector and hasattr(_memory_vector, 'healthy') and _memory_vector.healthy:
@@ -426,7 +439,11 @@ async def do_manage_memory(content: str, session_id: Optional[str] = None, owner
             return {"error": "New text cannot be empty"}
 
         with _memory_manager.lock:
-            memories = _memory_manager.load_all()
+            try:
+                memories = _memory_manager.load_all_for_update()
+            except MemoryStoreUnreadable as e:
+                logger.error("Refusing to edit memory, store unreadable: %s", e)
+                return {"error": "Memory store is temporarily unreadable — nothing was changed."}
             found = False
             for m in memories:
                 if m.get("id", "").startswith(memory_id):
@@ -451,8 +468,14 @@ async def do_manage_memory(content: str, session_id: Optional[str] = None, owner
         from services.memory.memory_tagger import tag_memory, apply_tags
         tag_result = await tag_memory(new_text, owner=owner, interactive=True)
         with _memory_manager.lock:
-            memories = _memory_manager.load_all()
-            target = next((m for m in memories if m["id"] == full_id), None)
+            try:
+                memories = _memory_manager.load_all_for_update()
+            except MemoryStoreUnreadable as e:
+                logger.info("Skipping tag re-apply, memory store unreadable: %s", e)
+                memories = None
+            target = None if memories is None else next(
+                (m for m in memories if m["id"] == full_id), None
+            )
             if target:
                 apply_tags(target, tag_result)
                 _memory_manager.save(memories)
@@ -473,7 +496,11 @@ async def do_manage_memory(content: str, session_id: Optional[str] = None, owner
         memory_id = lines[1].strip()
 
         with _memory_manager.lock:
-            memories = _memory_manager.load_all()
+            try:
+                memories = _memory_manager.load_all_for_update()
+            except MemoryStoreUnreadable as e:
+                logger.error("Refusing to delete memory, store unreadable: %s", e)
+                return {"error": "Memory store is temporarily unreadable — nothing was deleted."}
             original_len = len(memories)
             full_id = None
             delete_id = None
@@ -1178,7 +1205,10 @@ async def do_generate_image(content: str, session_id: Optional[str] = None, owne
                     error_text = err_json.get("error", {}).get("message", error_text) if isinstance(err_json.get("error"), dict) else str(err_json.get("error", error_text))
                 except Exception:
                     pass
-                return {"error": f"Image generation failed ({resp.status_code}): {error_text}"}
+                return {
+                    "error": f"Image generation failed ({resp.status_code}): {error_text}",
+                    "untrusted_content": True,
+                }
 
             data = resp.json()
             images = data.get("data", [])
@@ -1262,7 +1292,280 @@ async def do_generate_image(content: str, session_id: Optional[str] = None, owne
     except httpx.TimeoutException:
         return {"error": "Image generation timed out (300s). The model may be overloaded — try again or use quality=low."}
     except Exception as e:
-        return {"error": f"Image generation error: {str(e)}"}
+        return {
+            "error": f"Image generation error: {str(e)}",
+            "untrusted_content": True,
+        }
+
+
+async def do_edit_image(
+    prompt: str,
+    image_path: str,
+    model_spec: str = "",
+    session_id: Optional[str] = None,
+    owner: Optional[str] = None,
+    size: str = "1024x1024",
+    quality: str = "medium",
+    progress_callback: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
+) -> Dict:
+    """Edit an uploaded image using the configured image endpoint."""
+    import base64
+    import httpx
+    import mimetypes
+    import os
+    from pathlib import Path
+    from src.url_safety import check_outbound_url
+
+    prompt = (prompt or "").strip()
+    if not prompt:
+        return {"error": "Image edit prompt is required"}
+    path = Path(image_path)
+    if not path.exists() or not path.is_file():
+        return {"error": "Attached image file was not found"}
+
+    try:
+        from src.settings import load_settings
+        _settings = load_settings()
+    except Exception:
+        _settings = {}
+
+    if not model_spec:
+        model_spec = _settings.get("image_model", "")
+    if quality == "medium" and _settings.get("image_quality"):
+        quality = _settings["image_quality"]
+    if not model_spec:
+        return {"error": "No image model selected for image editing"}
+
+    try:
+        try:
+            def _call():
+                try:
+                    return _resolve_model(model_spec, owner=owner, model_type="image")
+                except TypeError as exc:
+                    if "model_type" not in str(exc):
+                        raise
+                    return _resolve_model(model_spec, owner=owner)
+            url, model_id, headers = await asyncio.to_thread(_call)
+        except ValueError:
+            url, model_id, headers = await asyncio.to_thread(_resolve_model, model_spec, owner=owner)
+    except ValueError:
+        return {"error": f"No endpoint found with image model '{model_spec}'."}
+
+    base_url = url.replace("/chat/completions", "").replace("/v1/messages", "").rstrip("/")
+    edits_url = base_url + "/images/edits"
+    mime = mimetypes.guess_type(str(path))[0] or "image/png"
+    payload = {
+        "model": model_id,
+        "prompt": prompt,
+        "n": "1",
+        "size": size,
+        "quality": quality if quality in ("low", "medium", "high", "auto") else "medium",
+        "response_format": "b64_json",
+    }
+    request_id = uuid.uuid4().hex
+    payload["request_id"] = request_id
+
+    logger.info("Image edit: model=%s, size=%s, quality=%s, image=%s, prompt=%s", model_id, size, quality, path.name, prompt[:80])
+
+    def _save_edited_image_to_gallery(filename: str) -> str:
+        try:
+            from src.database import SessionLocal as _GallerySL, GalleryImage
+            new_id = str(uuid.uuid4())
+            _gdb = _GallerySL()
+            _gdb.add(GalleryImage(
+                id=new_id,
+                filename=filename,
+                prompt=prompt,
+                model=model_id,
+                size=size,
+                quality=payload.get("quality", "medium"),
+                session_id=session_id,
+                owner=owner,
+            ))
+            _gdb.commit()
+            _gdb.close()
+            return new_id
+        except Exception as _ge:
+            logger.warning("Failed to save edited image gallery record: %s", _ge)
+            return ""
+
+    def _save_image_bytes(image_bytes: bytes, suffix: str = ".png") -> tuple[str, str]:
+        img_dir = Path(GENERATED_IMAGES_DIR)
+        img_dir.mkdir(parents=True, exist_ok=True)
+        filename = f"{uuid.uuid4().hex[:12]}{suffix}"
+        (img_dir / filename).write_bytes(image_bytes)
+        return f"/api/generated-image/{filename}", _save_edited_image_to_gallery(filename)
+
+    async def _try_local_img2img_fallback(client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
+        """Try Odysseus' local diffusion img2img endpoint.
+
+        Some self-hosted SD/SDXL endpoints expose text-to-image plus
+        `/images/harmonize`/img2img, but not OpenAI's multipart
+        `/images/edits`. For chat uploads ("image + prompt"), this gives the
+        expected instruction-edit behavior instead of stopping at a 400.
+        """
+        harmonize_url = base_url + "/images/harmonize"
+        try:
+            image_bytes = path.read_bytes()
+            image_b64 = base64.b64encode(image_bytes).decode()
+            fallback_payload = {
+                "image": image_b64,
+                "prompt": prompt,
+                "strength": 0.35,
+                "steps": 0,
+                "max_side": 1024,
+            }
+            if progress_callback:
+                await progress_callback({
+                    "status": "running",
+                    "message": "Trying image-to-image fallback",
+                    "step": 0,
+                    "total": 0,
+                })
+            fallback_resp = await client.post(harmonize_url, json=fallback_payload, headers=headers)
+            if fallback_resp.status_code == 404:
+                return None
+            if fallback_resp.status_code != 200:
+                error_text = fallback_resp.text[:500]
+                try:
+                    err_json = fallback_resp.json()
+                    error_text = err_json.get("detail") or err_json.get("error") or error_text
+                except Exception:
+                    pass
+                return {
+                    "error": f"Image edit fallback failed ({fallback_resp.status_code}): {error_text}",
+                    "untrusted_content": True,
+                }
+            fallback_data = fallback_resp.json()
+            image_b64 = fallback_data.get("image")
+            if not image_b64:
+                return {"error": "Image edit fallback returned no image"}
+            image_url, image_id = _save_image_bytes(base64.b64decode(image_b64))
+            return {
+                "results": f"Edited image for: {prompt[:100]}",
+                "image_url": image_url,
+                "image_id": image_id,
+                "image_prompt": prompt,
+                "image_model": model_id,
+                "image_size": size,
+                "image_quality": payload.get("quality", "medium"),
+                "edit_route": "img2img",
+            }
+        except httpx.TimeoutException:
+            return {"error": "Image edit fallback timed out. The model may still be loading or overloaded."}
+        except Exception as fallback_error:
+            logger.warning("Image edit fallback failed: %s", fallback_error)
+            return {"error": f"Image edit fallback error: {fallback_error}"}
+
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(connect=30.0, read=600.0, write=60.0, pool=30.0)) as client:
+            progress_task = None
+            if progress_callback:
+                progress_url = base_url + f"/images/progress/{request_id}"
+
+                async def _poll_progress():
+                    last_sig = None
+                    while True:
+                        try:
+                            pr = await client.get(progress_url, headers=headers, timeout=5.0)
+                            if pr.status_code == 404:
+                                return
+                            if pr.status_code == 200:
+                                data = pr.json()
+                                sig = (data.get("status"), data.get("step"), data.get("total"), data.get("percent"))
+                                if sig != last_sig:
+                                    last_sig = sig
+                                    await progress_callback(data)
+                                if data.get("status") in {"done", "error"}:
+                                    return
+                        except Exception:
+                            return
+                        await asyncio.sleep(1)
+
+                progress_task = asyncio.create_task(_poll_progress())
+            try:
+                with path.open("rb") as f:
+                    files = {"image": (path.name, f, mime)}
+                    resp = await client.post(edits_url, data=payload, files=files, headers=headers)
+            finally:
+                if progress_task:
+                    progress_task.cancel()
+                    try:
+                        await progress_task
+                    except asyncio.CancelledError:
+                        pass
+
+            if resp.status_code != 200:
+                error_text = resp.text[:500]
+                try:
+                    err_json = resp.json()
+                    err = err_json.get("error")
+                    error_text = (
+                        err.get("message", error_text)
+                        if isinstance(err, dict)
+                        else str(err or err_json.get("detail") or error_text)
+                    )
+                except Exception:
+                    pass
+                if resp.status_code in (400, 404, 405, 422):
+                    fallback = await _try_local_img2img_fallback(client)
+                    if fallback:
+                        return fallback
+                    if resp.status_code == 404:
+                        return {
+                            "error": (
+                                f"Image model '{model_id}' is reachable, but this endpoint does not expose image editing. "
+                                "Use it without an attached image for text-to-image generation, or serve an edit/img2img "
+                                "model for attached-image prompts."
+                            )
+                        }
+                return {
+                    "error": f"Image edit failed ({resp.status_code}): {error_text}",
+                    "untrusted_content": True,
+                }
+
+            data = resp.json()
+            images = data.get("data", [])
+            if not images:
+                return {"error": "No image returned from edit API"}
+
+            img = images[0]
+            image_url = None
+            image_id = None
+
+            if img.get("b64_json"):
+                image_url, image_id = _save_image_bytes(base64.b64decode(img.get("b64_json")))
+            elif img.get("url"):
+                result_url = img["url"]
+                ok, reason = check_outbound_url(
+                    result_url,
+                    block_private=os.getenv("IMAGE_BLOCK_PRIVATE_IPS", "false").lower() == "true",
+                )
+                if not ok:
+                    return {"error": f"Image edit API returned unsafe image URL: {reason}"}
+                dl_resp = httpx.get(result_url, timeout=60)
+                if dl_resp.status_code != 200:
+                    return {"error": f"Could not download edited image ({dl_resp.status_code})"}
+                image_url, image_id = _save_image_bytes(dl_resp.content)
+            else:
+                return {"error": "Image edit API returned unexpected format (no b64_json or url)"}
+
+            return {
+                "results": f"Edited image for: {prompt[:100]}",
+                "image_url": image_url,
+                "image_id": image_id,
+                "image_prompt": prompt,
+                "image_model": model_id,
+                "image_size": size,
+                "image_quality": payload.get("quality", "medium"),
+            }
+    except httpx.TimeoutException:
+        return {"error": "Image edit timed out. The model may still be loading or overloaded."}
+    except Exception as e:
+        return {
+            "error": f"Image edit error: {str(e)}",
+            "untrusted_content": True,
+        }
 
 
 async def do_edit_image(
