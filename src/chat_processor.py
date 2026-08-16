@@ -12,6 +12,33 @@ from services.memory.tier_scoring import TIER_CORE
 logger = logging.getLogger(__name__)
 
 
+# Straight and typographic quote pairs a model may wrap its reply in.
+_QUOTE_PAIRS = (('"', '"'), ("'", "'"), ("“", "”"), ("‘", "’"))
+
+
+def _strip_wrapping_quotes(text: str) -> str:
+    """Drop quote characters that wrap the whole query.
+
+    "Reply ONLY with the query" reliably produces a quoted reply from some
+    models (observed: ``"current weather"``). Passed through verbatim those
+    quotes become an exact-phrase operator on most engines, which silently
+    narrows the result set to near-nothing. Only balanced pairs enclosing the
+    *entire* string are removed, so a genuine phrase search the user typed
+    themselves (``berlin "hidden gems"``) is left alone.
+    """
+    text = text.strip()
+    while len(text) >= 2:
+        for opener, closer in _QUOTE_PAIRS:
+            if text[0] == opener and text[-1] == closer:
+                # Balanced only: an inner quote means the marks are load-bearing.
+                if closer not in text[1:-1]:
+                    text = text[1:-1].strip()
+                    break
+        else:
+            break
+    return text
+
+
 def _clean_search_query(query: str, max_len: int = 200) -> str:
     """Strip fenced code blocks from a search query while preserving inline
     code text.
@@ -47,6 +74,7 @@ def _clean_search_query(query: str, max_len: int = 200) -> str:
 
     text = soup.get_text(" ", strip=True)
     text = re.sub(r"\s+", " ", text)
+    text = _strip_wrapping_quotes(text)
     return text[:max_len]
 
 
