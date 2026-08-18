@@ -838,6 +838,39 @@ async function runCuratorForce() {
   return runCuratorApply(true);
 }
 
+// The tag-backfill pass visits each entry exactly once (a sidecar of scanned
+// ids), so entries tagged against a stale or empty registry can never improve
+// on their own. This clears that sidecar — the actual re-scan is the next
+// curator run. Confirmed rather than fire-and-forget: unlike the buttons
+// beside it, this queues a model pass over the *whole* store.
+async function rescanTagBackfill() {
+  const btn = document.getElementById('memory-rescan-tags-btn');
+  const ok = await uiModule.styledConfirm(
+    'Let the curator re-tag every memory?\n\nThis clears the record of which entries the '
+    + 'tag-backfill pass has already seen. The re-scan itself happens on the next curator '
+    + 'run and is a full model pass over the whole store.',
+    { confirmText: 'Re-scan' }
+  );
+  if (!ok) return;
+  if (btn) { btn.disabled = true; btn.textContent = 'Clearing…'; }
+  try {
+    const res = await fetch(`${window.location.origin}/api/memory/tag-backfill/rescan`, { method: 'POST' });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || 'Re-scan request failed');
+    }
+    const data = await res.json();
+    showToast(data.cleared
+      ? `${data.cleared} memories queued for re-tagging — run the curator to start`
+      : 'Nothing had been scanned yet — the next curator run already covers every memory');
+  } catch (error) {
+    console.error('Tag-backfill re-scan failed:', error);
+    showError('Could not queue the re-scan — check console');
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = 'Re-run tag backfill'; }
+  }
+}
+
 async function loadCuratorLog() {
   const summaryEl = document.getElementById('memory-curator-summary');
   const logEl = document.getElementById('memory-curator-log');
@@ -2175,6 +2208,9 @@ document.addEventListener('DOMContentLoaded', () => {
 
   const curatorForceBtn = document.getElementById('memory-curator-force-btn');
   if (curatorForceBtn) curatorForceBtn.addEventListener('click', runCuratorForce);
+
+  const rescanTagsBtn = document.getElementById('memory-rescan-tags-btn');
+  if (rescanTagsBtn) rescanTagsBtn.addEventListener('click', rescanTagBackfill);
 
   const contextDocRefreshBtn = document.getElementById('memory-context-doc-refresh-btn');
   if (contextDocRefreshBtn) contextDocRefreshBtn.addEventListener('click', loadContextDoc);

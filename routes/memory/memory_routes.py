@@ -27,7 +27,10 @@ from src.memory import compat_category, normalize_tags
 from src.request_models import MemoryAddRequest
 from core.database import SessionLocal
 from src.llm_core import llm_call_async
-from services.memory.memory_curator import curate, read_curation_log, undo_expire, undo_reword, clear_quarantine, list_quarantined
+from services.memory.memory_curator import (
+    curate, read_curation_log, undo_expire, undo_reword, clear_quarantine, list_quarantined,
+    clear_tag_backfill_state,
+)
 from services.memory.memory_context import MemoryContext
 from src.auth_helpers import get_current_user, require_user
 from src.endpoint_resolver import resolve_endpoint
@@ -455,6 +458,24 @@ def setup_memory_routes(memory_manager: MemoryManager, session_manager: SessionM
         if not clear_quarantine(memory_manager, user, memory_id, pass_name):
             raise HTTPException(404, "No quarantine found for that entry/pass")
         return {"ok": True}
+
+    @router.post("/tag-backfill/rescan")
+    def rescan_tag_backfill(request: Request):
+        """Forget which entries the curator's `tag_backfill` pass has already
+        scanned, so the next run re-tags the caller's whole store.
+
+        That pass visits each entry exactly once, and until 2026-08-18 it ran
+        against a registry that was only rebuilt at the *end* of a run — so
+        every entry's single visit used a stale or empty registry. This is the
+        catch-up path: nothing happens here beyond clearing the sidecar (and
+        the tidy fingerprint, or the next run would short-circuit as "already
+        clean"); the actual re-scan is the next curator run, which is an LLM
+        pass over every entry and therefore stays an explicit user action.
+        """
+        from src.auth_helpers import require_privilege
+        require_privilege(request, "can_manage_memory")
+        cleared = clear_tag_backfill_state(memory_manager, _owner(request))
+        return {"ok": True, "cleared": cleared}
 
     @router.post("/import")
     async def import_memories_from_file(

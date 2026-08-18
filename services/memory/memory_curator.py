@@ -83,6 +83,7 @@ from src.memory import MemoryStoreUnreadable
 from src.constants import DATA_DIR
 from services.memory.memory_context import _owner_slug
 from services.memory.memory_extractor import _fingerprint_entries
+from services.memory.memory_tagger import _TAG_DISCIPLINE_RULES
 from services.memory.tier_scoring import (
     TIER_ARCHIVE,
     TIER_CORE,
@@ -579,6 +580,45 @@ def _mark_backfilled(owner: Optional[str], ids: Set[str]) -> None:
     os.replace(tmp, path)
 
 
+def clear_tag_backfill_state(memory_manager, owner: Optional[str]) -> int:
+    """Forget which entries `tag_backfill` has already scanned, so the next
+    `curate()` re-scans this owner's whole store. Returns how many entries
+    were un-marked (0 if there was nothing to clear).
+
+    Manual, explicit, and deliberately not automatic: a re-scan is a full LLM
+    pass over every entry. It exists because `tag_backfill` visits an entry
+    exactly once, and until the registry-ordering fix above that one visit
+    happened against a stale or empty registry — so entries tagged by the old
+    behavior can never benefit from a better registry without this.
+
+    Also invalidates the tidy fingerprint, for the same reason
+    `clear_quarantine` does: clearing this sidecar changes nothing the
+    fingerprint tracks (id+text+tags), so the next run would short-circuit on
+    `already_tidy` and never actually re-scan. **This is the third
+    sidecar-clearing operation to need that pairing** (checkpoint, quarantine,
+    now tag_backfill) — treat "clear a sidecar" and "invalidate the tidy
+    fingerprint" as one operation, not two.
+    """
+    path = _tag_backfill_state_path(owner)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        count = len(data) if isinstance(data, dict) else 0
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        count = 0
+
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        logger.warning("Could not clear tag-backfill state for owner=%r: %s", owner, e)
+        return 0
+
+    _invalidate_tidy_state(memory_manager, owner)
+    return count
+
+
 # ---- "already evaluated" sidecar for the reword pass ----
 #
 # Same shape/rationale as the tag_backfill sidecar above: an id -> True map
@@ -768,6 +808,13 @@ def _user_message(payload: object, reminder: str) -> Dict:
 # than one call per entry (the write-time tagger's shape) because this pass
 # can potentially see the whole store at once on first deploy.
 
+# Shares `_TAG_DISCIPLINE_RULES` with the write-time tagger. The plan that
+# introduced those rules aimed them at `tag_memory()` alone, but this is the
+# other place tags are minted, with the same registry, the same prefix
+# vocabulary and the same failure modes — and the re-scan path added alongside
+# them (`clear_tag_backfill_state`) exists precisely to run this pass over a
+# whole store again. Left unreformed it would re-mint the junk vocabulary the
+# rules were written to stop, on the very run meant to demonstrate them.
 TAG_BACKFILL_SYSTEM_PROMPT = (
     "You tag existing memory entries for a personal memory system, using the "
     "tag registry below. For EVERY input entry, propose tags describing it.\n\n"
@@ -776,9 +823,10 @@ TAG_BACKFILL_SYSTEM_PROMPT = (
     "entry from your reply only if you have genuinely nothing to add to its "
     "existing tags.\n"
     "\"tags\": tags chosen from the REGISTRY that apply and are not already "
-    "on the entry. \"new_tags\": tags you believe are needed but are NOT in "
-    "the registry (kebab-case; person:/place:/org:/project: prefixes for "
-    "named entities). tags + new_tags combined must not exceed 10 per entry. "
+    "on the entry. \"new_tags\": tags that are needed but are NOT in the "
+    "registry.\n"
+    + _TAG_DISCIPLINE_RULES +
+    "- tags + new_tags combined must not exceed 5 per entry.\n"
     "Return ONLY valid JSON, no markdown fences, no commentary."
 )
 
@@ -791,21 +839,30 @@ def _needs_tag_backfill(entry: Dict, done_ids: Set[str]) -> bool:
 
 async def _tag_backfill_batch(
     batch: List[Dict], owner: Optional[str], cap: int, interactive: bool = False,
-    failures: Optional[List[str]] = None,
+    failures: Optional[List[str]] = None, registry: Optional[List[Dict]] = None,
 ) -> Tuple[List[Tuple[str, Dict, Dict]], Set[str]]:
     """Mutates entries in `batch` in place; returns (changelog actions, ids
     that were successfully scanned this call). The scanned-ids set includes
     every id in `batch` as long as the call's reply parsed, even ones the
     model omitted from its reply (an omission means "nothing to add", a
     legitimate outcome) — only a call that never produced usable JSON leaves
-    a batch's ids unscanned, so they're retried next run."""
+    a batch's ids unscanned, so they're retried next run.
+
+    `registry` is the freshly-rebuilt registry `curate()` computes before any
+    pass runs (see the note there). It is passed in rather than read off disk
+    because the on-disk copy is still last run's — the context doc isn't
+    rewritten until the final pass — and because a dry run must not write one
+    just so this pass can read it back. Falls back to the stored registry when
+    called standalone.
+    """
     from src.memory import normalize_tags
     from src.task_endpoint import memory_llm_call_async
-    from services.memory.memory_context import MemoryContext
+    from services.memory.memory_context import MemoryContext, registry_excerpt_of, registry_names_of
 
-    ctx = MemoryContext(owner)
-    registry_names = ctx.registry_names()
-    registry_excerpt = ctx.registry_excerpt(max_tags=cap)
+    if registry is None:
+        registry = MemoryContext(owner).load().get("tag_registry") or []
+    registry_names = registry_names_of(registry)
+    registry_excerpt = registry_excerpt_of(registry, max_tags=cap)
 
     payload = {
         "registry": registry_excerpt,
@@ -872,14 +929,14 @@ async def _tag_backfill_batch(
 
 async def _run_tag_backfill_pass(
     entries: List[Dict], owner: Optional[str], batch_size: int, cap: int, dry_run: bool, interactive: bool = False,
-    failures: Optional[List[str]] = None,
+    failures: Optional[List[str]] = None, registry: Optional[List[Dict]] = None,
 ) -> List[Dict]:
     quarantined = _quarantined_ids(_load_failure_state(owner), "tag_backfill")
     done_ids = _backfilled_ids(owner)
     pending = [e for e in entries if _needs_tag_backfill(e, done_ids) and e.get("id") not in quarantined]
 
     async def call_batch(sub_batch: List[Dict], local_failures: List[str]) -> Tuple[List[Tuple[str, Dict, Dict]], Set[str]]:
-        return await _tag_backfill_batch(sub_batch, owner, cap, interactive, local_failures)
+        return await _tag_backfill_batch(sub_batch, owner, cap, interactive, local_failures, registry=registry)
 
     def combine(a, b):
         return (a[0] + b[0], a[1] | b[1])
@@ -1786,11 +1843,34 @@ async def curate(
 
     failures: List[str] = []
     entries = [copy.deepcopy(e) for e in existing]
+
+    # Rebuild the tag registry BEFORE any pass runs. The registry is otherwise
+    # only rebuilt by `context_doc`, the LAST pass, while `tag_backfill` — the
+    # FIRST — is what consumes it, so every run read the registry as of the
+    # previous run and a first-ever run read an empty or category-era one.
+    # `tag_backfill` is a once-ever scan per entry, so that single visit used
+    # the worst registry the system would ever have. `build_registry` is pure
+    # code over live tag counts (no LLM), so doing it here is nearly free.
+    # `context_doc` still rebuilds at the end — later passes change tags.
+    #
+    # Computed unconditionally, ABOVE the checkpoint-resume loop, so a run
+    # resuming mid-way doesn't skip it. Held in memory and handed to the pass
+    # rather than saved: the on-disk copy stays owned by `context_doc`, which
+    # is also what keeps a dry run from writing anything.
+    from services.memory.memory_context import MemoryContext
+
+    registry = build_registry(
+        entries, cap, protected,
+        existing_registry=MemoryContext(owner).load().get("tag_registry"),
+    )
+
     with _collect_preview(preview_cap) as preview:
         for idx in range(start_idx, len(PASS_ORDER)):
             pass_name = PASS_ORDER[idx]
             if pass_name == "tag_backfill":
-                entries = await _run_tag_backfill_pass(entries, owner, batch_size, cap, dry_run, interactive, failures)
+                entries = await _run_tag_backfill_pass(
+                    entries, owner, batch_size, cap, dry_run, interactive, failures, registry=registry,
+                )
             elif pass_name == "triage":
                 entries = await _run_triage_pass(entries, owner, batch_size, dry_run, interactive, failures)
             elif pass_name == "dedupe":

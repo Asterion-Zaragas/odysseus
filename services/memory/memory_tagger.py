@@ -30,24 +30,53 @@ logger = logging.getLogger(__name__)
 
 FALLBACK_RESULT: Dict = {"tags": [], "provisional_tags": [], "generality": None}
 
+# Precision, granularity and taxonomy rules shared by this prompt and the
+# curator's `tag_backfill` prompt — the two places tags are minted. See
+# .AGENT_CONTEXT/plans/2026-08-05-tagger-registry-effectiveness.md (problem B)
+# for the observed failure each rule answers:
+#   - "prefer registry tags" had no opposing force, so a mediocre match beat
+#     no tag at all and broad wrong tags (`electronics` on a software entry)
+#     got applied — and, being broad, then out-counted precise ones in the
+#     registry and got re-offered. The loop closes with no outside input.
+#   - a 0-10 ceiling invites filling.
+#   - nothing said a tag has to *group* anything, so per-product singletons
+#     were minted that keyword search already finds by text.
+#   - only person:/place:/org:/project: were sanctioned, so the model
+#     improvised hyphenated pseudo-namespaces (`software-veracrypt`,
+#     `os-linux`) for topical domains. It wanted a rung that didn't exist.
+_TAG_DISCIPLINE_RULES = (
+    "- A WRONG tag is worse than no tag. Prefer existing registry tags over "
+    "inventing new ones, but never stretch one to cover an entry it doesn't "
+    "actually describe — returning no tags at all is a correct answer.\n"
+    "- A tag must GROUP. Do not mint a new tag unless it would plausibly "
+    "apply to two or three OTHER memories as well; a tag matching exactly one "
+    "memory does no work, because a keyword search already finds that entry "
+    "by its own text. Prefer the general level over the specific instance: "
+    "\"software\" rather than \"software:veracrypt\", unless several memories "
+    "really are about that one product.\n"
+    "- Tag style: kebab-case. Structured tags use a prefix from this FIXED "
+    "list and no other: person:, place:, org:, project:, software:, os:, "
+    "tech: — e.g. \"person:sven\", \"os:linux\". Do not invent new prefix "
+    "families, and do not improvise hyphenated stand-ins like "
+    "\"software-veracrypt\" for them.\n"
+)
+
 TAGGER_SYSTEM_PROMPT = (
     "You tag a single memory entry for a personal memory system. Given the "
     "memory text, an optional context hint, and the current tag registry, "
     "return STRICT JSON only:\n"
     '{"tags": ["..."], "new_tags": ["..."], "generality": 0-3}\n\n'
     "Rules:\n"
-    "- \"tags\": 0-10 tags chosen from the REGISTRY below that apply. Prefer "
-    "existing registry tags over inventing new ones.\n"
-    "- \"new_tags\": tags you believe are needed but are NOT in the registry "
-    "(e.g. a new person/place/project). Use the same kebab-case style; "
-    "structured tags use person:/place:/org:/project: prefixes, e.g. "
-    "\"person:sven\".\n"
+    "- \"tags\": 0-5 tags chosen from the REGISTRY below that genuinely apply.\n"
+    "- \"new_tags\": tags that are needed but are NOT in the registry (e.g. a "
+    "new person/place/project).\n"
+    + _TAG_DISCIPLINE_RULES +
     "- \"generality\": how broadly useful this fact is across future "
     "conversations. 3 = identity-level (name, job, home city, close "
     "relations). 2 = stable preference/relationship. 1 = project- or "
     "time-bound context. 0 = conversation-specific trivia. HIGHER means "
     "MORE durable/general.\n"
-    "- tags + new_tags combined must not exceed 10.\n"
+    "- tags + new_tags combined must not exceed 5.\n"
     "- Return ONLY the JSON object. No markdown fences, no commentary."
 )
 

@@ -31,7 +31,15 @@ class MemoryStoreUnreadable(RuntimeError):
 # in the entry's "provisional_tags" until a curator run promotes or merges them.
 
 MAX_TAGS = 10
-ALLOWED_TAG_PREFIXES = ("person", "place", "org", "project")
+# Named-entity prefixes, plus (2026-08-18) topical-domain ones. The taggers
+# were only ever given the first four, so for topical domains the model
+# improvised hyphenated stand-ins — "software-veracrypt", "os-linux" — and
+# `normalize_tag` then *enforced* that improvisation by flattening any
+# unsanctioned "x:y" to "x-y". Extending the prompts alone would have been
+# inert: this tuple is what decides whether "os:linux" survives as written.
+# See .AGENT_CONTEXT/plans/2026-08-05-tagger-registry-effectiveness.md (B3).
+# Additive only — existing hyphenated tags keep normalizing to themselves.
+ALLOWED_TAG_PREFIXES = ("person", "place", "org", "project", "software", "os", "tech")
 
 _TAG_CHARS_RE = re.compile(r"[^a-z0-9:-]+")
 _HYPHENS_RE = re.compile(r"-{2,}")

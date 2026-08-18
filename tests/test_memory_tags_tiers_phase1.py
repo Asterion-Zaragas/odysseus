@@ -47,6 +47,24 @@ def test_normalize_tag_prefixes():
     assert normalize_tag("person:") is None
 
 
+def test_normalize_tag_topical_domain_prefixes():
+    """2026-08-18: topical domains joined the named-entity prefixes. The
+    taggers had a scheme for people/places/orgs/projects and nothing for
+    domains, so they improvised `software-veracrypt` / `os-linux` — and this
+    function then *enforced* the improvisation by flattening any unsanctioned
+    `x:y`. Prompt rules alone would have been inert without this tuple.
+    See .AGENT_CONTEXT/plans/2026-08-05-tagger-registry-effectiveness.md (B3).
+    """
+    assert normalize_tag("os:linux") == "os:linux"
+    assert normalize_tag("Software: VeraCrypt") == "software:veracrypt"
+    assert normalize_tag("tech:self-hosting") == "tech:self-hosting"
+    # Additive only: tags already stored in the improvised hyphenated form
+    # still normalize to themselves, so nothing in the store is invalidated.
+    assert normalize_tag("software-veracrypt") == "software-veracrypt"
+    # And the list stays closed — an unsanctioned family is still flattened.
+    assert normalize_tag("hardware:gpu") == "hardware-gpu"
+
+
 def test_normalize_tag_rejects_empty_and_oversized():
     assert normalize_tag("") is None
     assert normalize_tag("   ") is None

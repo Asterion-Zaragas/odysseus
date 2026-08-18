@@ -55,6 +55,39 @@ def _empty_context() -> Dict:
     }
 
 
+# ---- registry views (pure, on a registry list) ----
+#
+# Split out of MemoryContext's methods so a caller holding a registry it has
+# just rebuilt in memory can render the same prompt excerpt without a
+# round-trip through disk. The curator needs exactly that: its `tag_backfill`
+# pass runs before the context doc is rewritten, so the registry it should be
+# reading doesn't exist on disk yet (see memory_curator's `curate`).
+
+_EMPTY_REGISTRY_NOTE = "(no tags registered yet — propose any that fit; they start provisional)"
+
+
+def registry_names_of(registry: Optional[List[Dict]]) -> Set[str]:
+    return {t.get("name") for t in (registry or []) if t.get("name")}
+
+
+def registry_excerpt_of(registry: Optional[List[Dict]], max_tags: int = 50) -> str:
+    if not registry:
+        return _EMPTY_REGISTRY_NOTE
+    ordered = sorted(registry, key=lambda t: -(t.get("count") or 0))[:max_tags]
+    lines = []
+    for t in ordered:
+        name = t.get("name")
+        if not name:
+            continue
+        bits = [name]
+        if t.get("description"):
+            bits.append(f"— {t['description']}")
+        if t.get("aliases"):
+            bits.append(f"(aka {', '.join(t['aliases'])})")
+        lines.append("- " + " ".join(bits))
+    return "\n".join(lines) if lines else _EMPTY_REGISTRY_NOTE
+
+
 class MemoryContext:
     """Loads/saves one owner's context document."""
 
@@ -89,31 +122,14 @@ class MemoryContext:
 
     def registry_names(self) -> Set[str]:
         """Tag names currently in the registry (cold-start: empty set)."""
-        ctx = self.load()
-        return {t.get("name") for t in (ctx.get("tag_registry") or []) if t.get("name")}
+        return registry_names_of(self.load().get("tag_registry"))
 
     # ---- compact excerpts for prompts ----
 
     def registry_excerpt(self, max_tags: int = 50) -> str:
         """Highest-usage tags first, capped at `max_tags` — keeps the tagger's
         prompt bounded regardless of how large the registry grows."""
-        ctx = self.load()
-        registry = ctx.get("tag_registry") or []
-        if not registry:
-            return "(no tags registered yet — propose any that fit; they start provisional)"
-        ordered = sorted(registry, key=lambda t: -(t.get("count") or 0))[:max_tags]
-        lines = []
-        for t in ordered:
-            name = t.get("name")
-            if not name:
-                continue
-            bits = [name]
-            if t.get("description"):
-                bits.append(f"— {t['description']}")
-            if t.get("aliases"):
-                bits.append(f"(aka {', '.join(t['aliases'])})")
-            lines.append("- " + " ".join(bits))
-        return "\n".join(lines) if lines else "(no tags registered yet — propose any that fit; they start provisional)"
+        return registry_excerpt_of(self.load().get("tag_registry"), max_tags=max_tags)
 
     def core_facts_excerpt(self) -> str:
         ctx = self.load()
