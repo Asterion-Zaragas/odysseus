@@ -375,6 +375,21 @@
             </div>
             <p class="memory-desc doclib-desc" style="margin-top:6px;">Dedupes, normalizes tags, rescores tiers, expires stale archive memories, and rebuilds the context doc below. Runs nightly; trigger it manually here.</p>
             <div id="memory-curator-preview-result" class="memory-curator-preview-result hidden"></div>
+            <!-- Dry-run proposals. Separate feed from the history list below:
+                 these come back inline in the /audit response, never from the
+                 changelog endpoint (which filters dry-run lines out so a
+                 proposed action can never reach the undo path). -->
+            <div id="memory-curator-proposed" class="memory-curator-proposed hidden">
+              <div class="memory-curator-section-head">
+                <span class="memory-curator-section-title">Proposed — not applied</span>
+                <span id="memory-curator-proposed-count" class="memory-curator-section-count"></span>
+              </div>
+              <div id="memory-curator-proposed-summary" class="memory-curator-summary"></div>
+              <div id="memory-curator-proposed-list" class="memory-list memory-curator-log"></div>
+            </div>
+            <div class="memory-curator-section-head">
+              <span class="memory-curator-section-title">Recent activity</span>
+            </div>
             <div id="memory-curator-summary" class="memory-curator-summary"></div>
             <div id="memory-curator-log" class="memory-list memory-curator-log"></div>
           </div>

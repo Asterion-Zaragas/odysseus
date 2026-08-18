@@ -352,7 +352,7 @@ def setup_memory_routes(memory_manager: MemoryManager, session_manager: SessionM
         # request — and deadlock (button stuck on "Running…", no LLM call made).
         result = await curate(memory_manager, memory_vector, owner=user, dry_run=dry_run, interactive=True, force=force)
 
-        return {
+        response = {
             "ok": True,
             "before": result.get("before", 0),
             "after": result.get("after", 0),
@@ -370,6 +370,18 @@ def setup_memory_routes(memory_manager: MemoryManager, session_manager: SessionM
             "had_failures": bool(result.get("had_failures")),
             "failure_count": result.get("failure_count", 0),
         }
+        # A dry run returns the actions it *would* have taken so the Curator
+        # tab's preview can show the full proposed changelog instead of only a
+        # count delta. A live run deliberately does not: its actions are
+        # already in `GET /curation-log`, and keeping the two feeds on separate
+        # sources is exactly what stops a proposed action reaching the undo
+        # path (that endpoint filters `dry_run` lines out of the log for the
+        # same reason). Passed through unchanged.
+        if "proposed_actions" in result:
+            response["proposed_actions"] = result["proposed_actions"]
+            response["proposed_total"] = result.get("proposed_total", 0)
+            response["proposed_truncated"] = bool(result.get("proposed_truncated"))
+        return response
 
     @router.get("/curation-log")
     def get_curation_log(request: Request, limit: int = 100):

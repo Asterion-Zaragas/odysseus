@@ -12479,7 +12479,9 @@ textarea.memory-add-input {
 .memory-tag-pill:hover {
   filter: brightness(1.25);
 }
-.memory-tag-pill.memory-tag-provisional {
+/* Dashed = provisional, in the Curator tab's tag deltas as well as Browse. */
+.memory-tag-pill.memory-tag-provisional,
+.memory-curator-tag.memory-tag-provisional {
   background: transparent;
   border: 1px dashed color-mix(in srgb, var(--fg) 30%, transparent);
   color: color-mix(in srgb, var(--fg) 45%, transparent);
@@ -12594,6 +12596,123 @@ textarea.memory-add-input {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+/* Expandable changelog rows: `-row` wraps the existing `-item` head plus an
+   optional detail body. The head keeps its own flex-row rules untouched —
+   `.memory-curator-log-item` is also used verbatim by the quarantine list. */
+.memory-curator-log-row {
+  display: flex;
+  flex-direction: column;
+  border-radius: 6px;
+}
+.memory-curator-log-expandable > .memory-curator-log-item { cursor: pointer; }
+.memory-curator-log-expandable > .memory-curator-log-item:hover {
+  background: color-mix(in srgb, var(--fg) 4%, transparent);
+}
+.memory-curator-log-expandable > .memory-curator-log-item:focus-visible {
+  outline: 1px solid var(--accent, var(--red));
+  outline-offset: -1px;
+}
+/* Affordance: a caret before the action badge, rotated when open. */
+.memory-curator-log-expandable > .memory-curator-log-item::before {
+  content: '';
+  flex-shrink: 0;
+  width: 0;
+  height: 0;
+  border-left: 4px solid color-mix(in srgb, var(--fg) 40%, transparent);
+  border-top: 3.5px solid transparent;
+  border-bottom: 3.5px solid transparent;
+  transition: transform 0.12s ease;
+}
+.memory-curator-log-open > .memory-curator-log-item::before { transform: rotate(90deg); }
+.memory-curator-log-open { background: color-mix(in srgb, var(--fg) 4%, transparent); }
+
+.memory-curator-log-body {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 2px 10px 8px 22px;
+}
+.memory-curator-log-body.hidden { display: none; }
+.memory-curator-log-block {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 11px;
+}
+.memory-curator-log-label {
+  flex-shrink: 0;
+  width: 92px;
+  text-align: right;
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: color-mix(in srgb, var(--fg) 35%, transparent);
+}
+.memory-curator-log-value {
+  flex: 1;
+  min-width: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: color-mix(in srgb, var(--fg) 75%, transparent);
+}
+.memory-curator-log-value-plain { color: color-mix(in srgb, var(--fg) 45%, transparent); }
+/* Before/after halves of a diff — the reword pass is the reason this exists. */
+.memory-curator-log-value-old {
+  color: color-mix(in srgb, var(--fg) 50%, transparent);
+  border-left: 2px solid color-mix(in srgb, var(--red) 45%, transparent);
+  padding-left: 7px;
+}
+.memory-curator-log-value-new {
+  color: color-mix(in srgb, var(--fg) 85%, transparent);
+  border-left: 2px solid color-mix(in srgb, #98c379 55%, transparent);
+  padding-left: 7px;
+}
+.memory-curator-log-tags {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+/* Tag deltas reuse the Browse tab's badge look, minus the click affordance —
+   these are read-only, they don't filter the memory list. */
+.memory-curator-tag { cursor: default; }
+.memory-curator-tag-added {
+  background: color-mix(in srgb, #98c379 20%, transparent);
+  color: #98c379;
+}
+.memory-curator-tag-removed {
+  background: color-mix(in srgb, var(--red) 15%, transparent);
+  color: var(--red);
+  text-decoration: line-through;
+}
+.memory-curator-tag-kept { opacity: 0.55; }
+
+/* Preview vs. history: two feeds in one card, so each gets a heading. */
+.memory-curator-section-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-top: 14px;
+}
+.memory-curator-section-title {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: color-mix(in srgb, var(--fg) 45%, transparent);
+}
+.memory-curator-section-count {
+  font-size: 10px;
+  color: color-mix(in srgb, var(--fg) 32%, transparent);
+}
+.memory-curator-proposed {
+  border-left: 2px solid color-mix(in srgb, var(--hl-function) 45%, transparent);
+  padding-left: 10px;
+  margin-top: 4px;
+}
+.memory-curator-proposed .memory-curator-section-head { margin-top: 8px; }
+.memory-curator-proposed.hidden { display: none; }
 .memory-curator-log-time {
   font-size: 9px;
   color: color-mix(in srgb, var(--fg) 35%, transparent);

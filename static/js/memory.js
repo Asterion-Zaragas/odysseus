@@ -735,6 +735,8 @@ async function runCuratorPreview() {
     const data = await res.json();
     if (resultEl) {
       resultEl.classList.remove('hidden');
+      // The count delta stays — it's still the useful at-a-glance number,
+      // just no longer the only thing the preview shows.
       let text = data.already_tidy
         ? 'Preview: already clean — nothing to do.'
         : `Preview: would remove ${data.removed} (${data.before} → ${data.after}). Nothing was saved — click "Run curator" to apply.`;
@@ -743,12 +745,46 @@ async function runCuratorPreview() {
       }
       resultEl.textContent = text;
     }
+    renderCuratorProposed(data);
   } catch (error) {
     console.error('Curator preview failed:', error);
     showError('Curator preview failed — check console');
+    hideCuratorProposed();
   } finally {
     if (btn) { btn.disabled = false; btn.textContent = 'Preview (dry run)'; }
   }
+}
+
+function hideCuratorProposed() {
+  const card = document.getElementById('memory-curator-proposed');
+  if (card) card.classList.add('hidden');
+}
+
+// The full proposed changelog for a dry run, rendered from the actions the
+// response carried inline. It uses the *same* row component as the history
+// list below it, with two differences: the "proposed — not applied" heading,
+// and no undo buttons (guarded inside `renderCuratorLogList`, and again by
+// the `dry_run` marker on every row — see `_curatorActionCanUndo`).
+function renderCuratorProposed(data) {
+  const card = document.getElementById('memory-curator-proposed');
+  const countEl = document.getElementById('memory-curator-proposed-count');
+  const summaryEl = document.getElementById('memory-curator-proposed-summary');
+  const listEl = document.getElementById('memory-curator-proposed-list');
+  if (!card || !listEl) return;
+  if (data.already_tidy) { hideCuratorProposed(); return; }
+
+  const actions = Array.isArray(data.proposed_actions) ? data.proposed_actions : [];
+  const total = Number.isFinite(data.proposed_total) ? data.proposed_total : actions.length;
+  card.classList.remove('hidden');
+  if (countEl) {
+    countEl.textContent = data.proposed_truncated
+      ? `showing first ${actions.length} of ${total}`
+      : `${total} action${total === 1 ? '' : 's'}`;
+  }
+  if (summaryEl) renderCuratorSummary(actions, summaryEl);
+  // Server order = pass order, i.e. the order these would actually be applied
+  // in. Not reversed to newest-first like the history feed.
+  renderCuratorLogList(actions, listEl, { proposed: true });
 }
 
 async function runCuratorApply(force) {
@@ -783,6 +819,12 @@ async function runCuratorApply(force) {
       message = `Curator: ${data.removed} removed (${data.before} → ${data.after})`;
     }
     showToast(message);
+    // Any preview on screen described the store as it was *before* this run —
+    // leaving it up would show proposals that have now either happened or
+    // become moot. The history list below is the record from here on.
+    hideCuratorProposed();
+    const previewResult = document.getElementById('memory-curator-preview-result');
+    if (previewResult) previewResult.classList.add('hidden');
     await Promise.all([loadCuratorLog(), loadContextDoc(), loadMemories(), loadQuarantineList()]);
   } catch (error) {
     console.error('Curator run failed:', error);
@@ -827,59 +869,325 @@ function renderCuratorSummary(entries, container) {
   });
 }
 
-function _describeCuratorAction(entry) {
-  if (entry.action === 'quarantine' && entry.after) {
-    const a = entry.after;
-    return `${a.pass} pass gave up on this entry after ${a.count} failure(s) (${a.error || 'unknown error'})`;
-  }
-  if (entry.action === 'unquarantine' && entry.after) {
-    return `${entry.after.pass} pass will retry this entry`;
-  }
-  if (entry.action === 'reword_refused' && entry.before) {
-    return `Reword declined: ${entry.before.reason || 'guard check failed'}`;
-  }
-  const text = (entry.after && entry.after.text) || (entry.before && entry.before.text);
-  if (text) return text;
-  const tags = (entry.after && entry.after.tags) || (entry.before && entry.before.tags);
-  if (tags && tags.length) return tags.join(', ');
-  return entry.action || '';
+// ---- changelog row rendering ----
+//
+// `_describeCuratorAction` turns one changelog line into `{summary, detail}`:
+// a one-line headline for the collapsed row plus, where there's more to say,
+// an expandable body of structured blocks. It used to return a bare string
+// that fell through to `after.text || before.text` for everything it didn't
+// special-case, which meant every action whose interesting change *isn't* the
+// text (retag, tag_backfill, merge, tier changes) rendered as the entry text
+// and so looked identical before and after.
+//
+// Two properties this function must keep: it is **pure** (no DOM, no fetch —
+// the node tests call it directly) and **total**. It renders straight from an
+// append-only JSONL file going back to Phase 4, so a line may lack any field
+// a newer rendering wants; every accessor defaults, and the whole dispatch
+// sits behind a catch that degrades to the generic fallback rather than
+// throwing and taking the rest of the list down with it.
+
+function _curatorTagList(obj, field) {
+  const v = obj && !Array.isArray(obj) ? obj[field] : null;
+  return Array.isArray(v) ? v.filter(t => typeof t === 'string') : [];
 }
 
-function renderCuratorLogList(entries, container) {
+// Added / removed / kept, in that order — the changed tags are the point, and
+// putting them first keeps them visible when the row is narrow.
+function _curatorTagDelta(before, after, field) {
+  const b = _curatorTagList(before, field);
+  const a = _curatorTagList(after, field);
+  const bSet = new Set(b);
+  const aSet = new Set(a);
+  return a.filter(t => !bSet.has(t)).map(name => ({ name, state: 'added' }))
+    .concat(b.filter(t => !aSet.has(t)).map(name => ({ name, state: 'removed' })))
+    .concat(a.filter(t => bSet.has(t)).map(name => ({ name, state: 'kept' })));
+}
+
+function _curatorTierLabel(tier) {
+  if (!Number.isFinite(tier)) return '?';
+  return MEMORY_TIER_NAMES[tier] ? `${tier} (${MEMORY_TIER_NAMES[tier]})` : String(tier);
+}
+
+function _curatorFallbackSummary(action, before, after) {
+  // The pre-existing generic rendering, kept verbatim as the fallback for any
+  // action added later. This is why `tag_backfill` needed no frontend change
+  // when it landed — don't regress it.
+  const text = (after && !Array.isArray(after) && after.text) || (before && !Array.isArray(before) && before.text);
+  if (text) return text;
+  const tags = _curatorTagList(after, 'tags').concat(_curatorTagList(before, 'tags'));
+  if (tags.length) return tags.join(', ');
+  return action || '';
+}
+
+function _describeCuratorActionInner(action, before, after) {
+  // tag_normalize's `retag` is a store-wide tag RENAME, not an entry retag:
+  // it logs {tag: from} / {tag: into} and carries no entry at all. Same action
+  // name, different payload — check for it before the entry-shaped branch.
+  if (action === 'retag' && before && before.tag && !before.id) {
+    const into = (after && after.tag) || '?';
+    return { summary: `tag "${before.tag}" → "${into}" — renamed across every entry`, detail: null };
+  }
+
+  if (action === 'retag' || action === 'tag_backfill') {
+    const tags = _curatorTagDelta(before, after, 'tags');
+    const prov = _curatorTagDelta(before, after, 'provisional_tags');
+    const changed = tags.concat(prov).filter(t => t.state !== 'kept');
+    const text = (after && after.text) || (before && before.text) || '';
+    const detail = [];
+    if (text) detail.push({ label: 'entry', kind: 'text', value: text });
+    if (tags.length) detail.push({ label: 'tags', kind: 'tags', tags: tags });
+    if (prov.length) detail.push({ label: 'provisional', kind: 'tags', tags: prov, provisional: true });
+    return {
+      summary: changed.length
+        ? changed.map(t => (t.state === 'added' ? '+' : '−') + t.name).join(' ')
+        : 'no tag change',
+      detail: detail.length ? detail : null,
+    };
+  }
+
+  if (action === 'reword') {
+    // The headline feature: without the old text alongside the new one there
+    // is no way to judge whether the reword pass improved anything.
+    const oldText = (before && before.text) || '';
+    const newText = (after && after.text) || '';
+    return {
+      summary: newText || oldText || 'reworded',
+      detail: [
+        { label: 'before', kind: 'old', value: oldText || '(not recorded)' },
+        { label: 'after', kind: 'new', value: newText || '(not recorded)' },
+      ],
+    };
+  }
+
+  if (action === 'reword_refused') {
+    const reason = (before && before.reason) || 'guard check failed';
+    const text = (before && before.text) || '';
+    return {
+      summary: `Reword declined: ${reason}`,
+      detail: text ? [{ label: 'original', kind: 'text', value: text }] : null,
+    };
+  }
+
+  if (action === 'undo_reword') {
+    const text = (after && after.text) || '';
+    return { summary: text ? `Restored earlier wording: ${text}` : 'Restored earlier wording', detail: null };
+  }
+
+  if (action === 'undo_expire') {
+    const text = (after && after.text) || '';
+    return { summary: text ? `Restored: ${text}` : 'Restored an expired memory', detail: null };
+  }
+
+  if (action === 'merge') {
+    // dedupe logs merges with LISTS: `before` is every dropped entry,
+    // `after` is [the kept entry] with the tag union already applied.
+    const dropped = Array.isArray(before) ? before : (before ? [before] : []);
+    const keptList = Array.isArray(after) ? after : (after ? [after] : []);
+    const kept = keptList[0] || null;
+    const keptText = (kept && kept.text) || '(unknown)';
+    const detail = [{ label: 'kept', kind: 'new', value: keptText }];
+    dropped.forEach(d => detail.push({ label: 'dropped', kind: 'old', value: (d && d.text) || '(unknown)' }));
+    const union = _curatorTagList(kept, 'tags');
+    if (union.length) {
+      detail.push({ label: 'tags after merge', kind: 'tags', tags: union.map(name => ({ name, state: 'kept' })) });
+    }
+    return {
+      summary: `kept "${keptText}" — dropped ${dropped.length} duplicate${dropped.length === 1 ? '' : 's'}`,
+      detail: detail,
+    };
+  }
+
+  if (action === 'expire') {
+    // Both real expiries and dedupe's "worthless entry" removals log here,
+    // in both cases with the full entry as `before` (that snapshot is what
+    // undo restores from).
+    const e = (before && !Array.isArray(before)) ? before : {};
+    const detail = [];
+    if (e.text) detail.push({ label: 'entry', kind: 'text', value: e.text });
+    const why = [];
+    if (Number.isFinite(e.tier)) why.push(`tier ${_curatorTierLabel(e.tier)}`);
+    const lastUsed = e.last_used_at || e.timestamp;
+    if (lastUsed) why.push(`last used ${relativeTime(Math.floor(lastUsed))}`);
+    if (Number.isFinite(e.uses)) why.push(`${e.uses} use${e.uses === 1 ? '' : 's'}`);
+    if (why.length) detail.push({ label: 'why', kind: 'plain', value: why.join(' · ') });
+    const tags = _curatorTagList(e, 'tags');
+    if (tags.length) {
+      detail.push({ label: 'tags', kind: 'tags', tags: tags.map(name => ({ name, state: 'kept' })) });
+    }
+    return { summary: e.text || 'expired entry', detail: detail.length ? detail : null };
+  }
+
+  if (action === 'promote' || action === 'demote') {
+    // Lower tier number = more durable, so `promote` moves the number DOWN.
+    const from = _curatorTierLabel(before && before.tier);
+    const to = _curatorTierLabel(after && after.tier);
+    return { summary: `tier ${from} → ${to}`, detail: null };
+  }
+
+  if (action === 'quarantine' && after) {
+    const summary = `${after.pass} pass gave up on this entry after ${after.count} failure(s) (${after.error || 'unknown error'})`;
+    // `threshold` is only present on the dry-run preview line, where it
+    // answers the question the row actually raises: is this the one that
+    // tips it over?
+    const detail = Number.isFinite(after.threshold)
+      ? [{ label: 'failures', kind: 'plain', value: `${after.count} of ${after.threshold} before quarantine` }]
+      : null;
+    return { summary, detail };
+  }
+
+  if (action === 'unquarantine' && after) {
+    return { summary: `${after.pass} pass will retry this entry`, detail: null };
+  }
+
+  return { summary: _curatorFallbackSummary(action, before, after), detail: null };
+}
+
+function _describeCuratorAction(entry) {
+  const action = (entry && entry.action) || 'unknown';
+  const before = (entry && entry.before) || null;
+  const after = (entry && entry.after) || null;
+  try {
+    const described = _describeCuratorActionInner(action, before, after);
+    return { summary: described.summary || action, detail: described.detail || null };
+  } catch (error) {
+    // Totality backstop — see the note above. A legacy line with an
+    // unexpected shape degrades to the generic rendering, never an exception
+    // that would leave the rest of the changelog unrendered.
+    console.warn('Could not describe curator action:', action, error);
+    return { summary: _curatorFallbackSummary(action, before, after), detail: null };
+  }
+}
+
+// Undo eligibility is a property of the row's own data, deliberately not of
+// which caller rendered it. An undo button on a *proposed* action would offer
+// to reverse a change that never happened — the exact bug Phase 7's
+// `include_dry_run=False` log filter closed — and both feeds render through
+// this one component, so the `dry_run` marker the API carries on every
+// proposed action is checked here rather than trusted to the call site.
+function _curatorActionCanUndo(entry) {
+  if (!entry || entry.dry_run) return false;
+  if (entry.action !== 'expire' && entry.action !== 'reword') return false;
+  return !!(entry.before && !Array.isArray(entry.before) && entry.before.id);
+}
+
+function _buildCuratorDetailBody(blocks) {
+  const body = document.createElement('div');
+  body.className = 'memory-curator-log-body';
+  blocks.forEach(block => {
+    const line = document.createElement('div');
+    line.className = 'memory-curator-log-block';
+
+    const label = document.createElement('span');
+    label.className = 'memory-curator-log-label';
+    label.textContent = block.label;
+    line.appendChild(label);
+
+    if (block.kind === 'tags') {
+      const tagWrap = document.createElement('span');
+      tagWrap.className = 'memory-curator-log-tags';
+      (block.tags || []).forEach(tag => {
+        // Non-interactive on purpose: the Browse tab's pills filter the
+        // memory list, which would be a surprising thing for a Curator-tab
+        // row to do. Same look, no click handler.
+        const pill = document.createElement('span');
+        const colorClass = _KNOWN_TAG_COLOR_CLASSES.has(tag.name) ? ' memory-cat-' + tag.name : '';
+        pill.className = 'memory-cat-badge memory-curator-tag memory-curator-tag-' + tag.state
+          + colorClass + (block.provisional ? ' memory-tag-provisional' : '');
+        pill.textContent = (tag.state === 'added' ? '+' : tag.state === 'removed' ? '−' : '') + tag.name;
+        pill.title = block.provisional
+          ? `${tag.name} — provisional, not yet confirmed by the curator`
+          : `${tag.name} — ${tag.state}`;
+        tagWrap.appendChild(pill);
+      });
+      line.appendChild(tagWrap);
+    } else {
+      const value = document.createElement('span');
+      value.className = 'memory-curator-log-value memory-curator-log-value-' + (block.kind || 'text');
+      value.textContent = block.value;
+      line.appendChild(value);
+    }
+
+    body.appendChild(line);
+  });
+  return body;
+}
+
+function renderCuratorLogList(entries, container, options) {
+  const proposed = !!(options && options.proposed);
   container.innerHTML = '';
   if (!entries.length) {
-    container.innerHTML = '<div class="memory-empty">No curator activity yet — it runs nightly, or trigger a run above.</div>';
+    container.innerHTML = proposed
+      ? '<div class="memory-empty">Nothing proposed — the curator would leave the store as it is.</div>'
+      : '<div class="memory-empty">No curator activity yet — it runs nightly, or trigger a run above.</div>';
     return;
   }
   entries.forEach(entry => {
+    const described = _describeCuratorAction(entry);
+
     const row = document.createElement('div');
-    row.className = 'memory-curator-log-item';
+    row.className = 'memory-curator-log-row';
+
+    const head = document.createElement('div');
+    head.className = 'memory-curator-log-item';
+    row.appendChild(head);
 
     const badge = document.createElement('span');
     badge.className = 'memory-curator-log-action action-' + (entry.action || 'unknown');
     badge.textContent = entry.action || 'unknown';
-    row.appendChild(badge);
+    head.appendChild(badge);
 
     const detail = document.createElement('span');
     detail.className = 'memory-curator-log-detail';
-    detail.textContent = _describeCuratorAction(entry);
-    detail.title = detail.textContent;
-    row.appendChild(detail);
+    detail.textContent = described.summary;
+    detail.title = described.summary;
+    head.appendChild(detail);
 
     if (entry.ts) {
       const time = document.createElement('span');
       time.className = 'memory-curator-log-time';
       time.textContent = relativeTime(Math.floor(entry.ts));
       time.title = new Date(entry.ts * 1000).toLocaleString();
-      row.appendChild(time);
+      head.appendChild(time);
     }
 
-    if ((entry.action === 'expire' || entry.action === 'reword') && entry.before && entry.before.id) {
+    // `proposed` is a second belt on top of the per-row `dry_run` check: this
+    // list must never grow an undo button for something that hasn't happened.
+    if (!proposed && _curatorActionCanUndo(entry)) {
       const undoBtn = document.createElement('button');
       undoBtn.className = 'memory-item-btn memory-curator-log-undo';
       undoBtn.textContent = 'undo';
-      undoBtn.addEventListener('click', () => undoCuratorAction(entry.before.id, entry.action, undoBtn));
-      row.appendChild(undoBtn);
+      undoBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        undoCuratorAction(entry.before.id, entry.action, undoBtn);
+      });
+      head.appendChild(undoBtn);
+    }
+
+    // Rows expand on click rather than showing everything inline — a real
+    // store produces long lists, and the old `title` tooltip is unreadable
+    // for a multi-line before/after.
+    if (described.detail) {
+      const body = _buildCuratorDetailBody(described.detail);
+      body.classList.add('hidden');
+      row.appendChild(body);
+      row.classList.add('memory-curator-log-expandable');
+      head.setAttribute('role', 'button');
+      head.setAttribute('tabindex', '0');
+      head.setAttribute('aria-expanded', 'false');
+      const toggle = () => {
+        const open = body.classList.toggle('hidden') === false;
+        row.classList.toggle('memory-curator-log-open', open);
+        head.setAttribute('aria-expanded', open ? 'true' : 'false');
+      };
+      head.addEventListener('click', (e) => {
+        if (e.target.closest('button')) return;
+        toggle();
+      });
+      head.addEventListener('keydown', (e) => {
+        if (e.key !== 'Enter' && e.key !== ' ') return;
+        e.preventDefault();
+        toggle();
+      });
     }
 
     container.appendChild(row);

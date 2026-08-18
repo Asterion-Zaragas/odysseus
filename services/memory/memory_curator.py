@@ -69,13 +69,15 @@ a nightly per-owner loop double-curate every real owner's data under the
 legacy pass too.
 """
 
+import contextlib
+import contextvars
 import copy
 import json
 import logging
 import os
 import re
 import time
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, Iterator, List, Optional, Set, Tuple
 
 from src.memory import MemoryStoreUnreadable
 from src.constants import DATA_DIR
@@ -171,13 +173,104 @@ def _log_path(owner: Optional[str]) -> str:
 
 
 def _log_action(owner: Optional[str], action: str, before=None, after=None, dry_run: bool = False) -> None:
-    os.makedirs(CURATION_LOG_DIR, exist_ok=True)
     line = {"ts": time.time(), "action": action, "before": before, "after": after, "dry_run": dry_run}
+    _collect_action(line)
+    os.makedirs(CURATION_LOG_DIR, exist_ok=True)
     try:
         with open(_log_path(owner), "a", encoding="utf-8") as f:
             f.write(json.dumps(line, ensure_ascii=False, default=str) + "\n")
     except OSError as e:
         logger.warning("Could not write curation log for owner=%r: %s", owner, e)
+
+
+# ---- dry-run proposal collection (the Curator tab's preview) ----
+#
+# A dry run logs every action it *would* have taken, but
+# `read_curation_log(include_dry_run=False)` deliberately filters those lines
+# back out of the Curator tab's history feed: presenting a proposal as "what
+# the curator did" shows phantom merges/expiries and can offer to undo one —
+# the exact hole Phase 7 closed (see `read_curation_log`'s docstring). The
+# preview still has to *show* them, so `curate(dry_run=True)` returns them
+# inline in its response instead. Two feeds, two sources, no overlap.
+#
+# Collection hooks `_log_action` rather than threading a list back through
+# every pass, because that is the one funnel every action already goes
+# through — including the ones no pass returns (`_handle_quarantine_candidate`
+# logs its dry-run `quarantine` preview directly). A pass added later is
+# previewable with no extra wiring and there is no signature to forget. A
+# ContextVar rather than a module global keeps concurrent runs — the nightly
+# per-owner loop and a manual `/api/memory/audit` — out of each other's list.
+
+_PREVIEW_ACTION_CAP = 200
+_PREVIEW_TEXT_LIMIT = 600
+
+_preview_sink: "contextvars.ContextVar[Optional[Dict]]" = contextvars.ContextVar(
+    "memory_curator_preview_sink", default=None
+)
+
+
+def _preview_cap() -> int:
+    from src.settings import get_setting
+
+    try:
+        return max(0, int(get_setting("memory_curator_preview_cap", _PREVIEW_ACTION_CAP)))
+    except (TypeError, ValueError):
+        return _PREVIEW_ACTION_CAP
+
+
+def _trim_for_preview(value):
+    """Bound one snapshot's size. Entry text is normally a sentence, but
+    nothing enforces that and this list is assembled in memory inside an HTTP
+    request, so a pathological entry must not be able to bloat the response.
+    Only `text` is trimmed — it's the one unbounded field, and the rendering
+    that diffs it (reword) stays readable well past this limit."""
+    if isinstance(value, list):
+        return [_trim_for_preview(v) for v in value]
+    if not isinstance(value, dict):
+        return value
+    out = copy.deepcopy(value)
+    text = out.get("text")
+    if isinstance(text, str) and len(text) > _PREVIEW_TEXT_LIMIT:
+        out["text"] = text[:_PREVIEW_TEXT_LIMIT] + "…"
+        out["text_truncated"] = True
+    return out
+
+
+def _collect_action(line: Dict) -> None:
+    """Append a just-logged action to the active preview sink, if any."""
+    sink = _preview_sink.get()
+    if sink is None:
+        return
+    sink["total"] += 1
+    if len(sink["actions"]) < sink["cap"]:
+        sink["actions"].append({
+            "ts": line["ts"],
+            "action": line["action"],
+            "before": _trim_for_preview(line["before"]),
+            "after": _trim_for_preview(line["after"]),
+            # Carried through verbatim so the frontend's undo guard is a
+            # property of the row's own data, not of which call site rendered
+            # it — see `_curatorActionCanUndo` in static/js/memory.js.
+            "dry_run": line["dry_run"],
+        })
+
+
+@contextlib.contextmanager
+def _collect_preview(cap: Optional[int]) -> Iterator[Optional[Dict]]:
+    """Capture every action logged inside the block, up to `cap` of them
+    (`total` still counts them all, so the caller can report truncation).
+    `cap=None` disables collection entirely — a live run's actions are
+    already covered by the history feed, so it pays neither the memory nor
+    the copy cost."""
+    if cap is None:
+        yield None
+        return
+    sink: Dict = {"actions": [], "total": 0, "cap": max(0, int(cap))}
+    token = _preview_sink.set(sink)
+    try:
+        yield sink
+    finally:
+        _preview_sink.reset(token)
 
 
 def read_curation_log(owner: Optional[str], limit: int = 100, include_dry_run: bool = True) -> List[Dict]:
@@ -1674,6 +1767,9 @@ async def curate(
     last_completed = checkpoint.get("last_completed_pass")
     start_idx = (PASS_ORDER.index(last_completed) + 1) if last_completed in PASS_ORDER else 0
 
+    # Dry runs only: a live run's actions are already in the history feed.
+    preview_cap = _preview_cap() if dry_run else None
+
     def _persist(current_entries: List[Dict]) -> None:
         """Merge this owner's working set back into the live store (preserving
         other owners and any entries added concurrently during the run) and
@@ -1690,35 +1786,36 @@ async def curate(
 
     failures: List[str] = []
     entries = [copy.deepcopy(e) for e in existing]
-    for idx in range(start_idx, len(PASS_ORDER)):
-        pass_name = PASS_ORDER[idx]
-        if pass_name == "tag_backfill":
-            entries = await _run_tag_backfill_pass(entries, owner, batch_size, cap, dry_run, interactive, failures)
-        elif pass_name == "triage":
-            entries = await _run_triage_pass(entries, owner, batch_size, dry_run, interactive, failures)
-        elif pass_name == "dedupe":
-            entries = await _run_dedupe_pass(entries, owner, batch_size, dry_run, interactive, failures)
-        elif pass_name == "tag_normalize":
-            entries = await _run_tag_normalize_pass(entries, owner, cap, protected, dry_run, interactive, failures)
-        elif pass_name == "reword":
-            entries = await _run_reword_pass(entries, owner, batch_size, dry_run, memory_vector, interactive, failures)
-        elif pass_name == "rescore":
-            entries = _run_rescore_pass(entries, owner, dry_run)
-        elif pass_name == "expire":
-            entries = _run_expire_pass(entries, owner, protected, expiry_days, dry_run)
-        elif pass_name == "context_doc":
-            await _run_context_doc_pass(owner, entries, cap, protected, dry_run, interactive, failures)
-        if not dry_run:
-            # Write-ahead ordering: a completed pass's mutations MUST be on
-            # disk before the checkpoint marks it done. curate() only ever
-            # persisted at the very end before this, so a crash in a later
-            # pass would advance the checkpoint (per-pass) yet lose every
-            # in-memory mutation — the resumed run then reloads the
-            # un-mutated store and SKIPS the "completed" pass, stranding
-            # entries (e.g. untriaged, generality=None, which the tags-only
-            # fingerprint short-circuit could then make permanent).
-            _persist(entries)
-            _save_checkpoint(owner, pass_name)
+    with _collect_preview(preview_cap) as preview:
+        for idx in range(start_idx, len(PASS_ORDER)):
+            pass_name = PASS_ORDER[idx]
+            if pass_name == "tag_backfill":
+                entries = await _run_tag_backfill_pass(entries, owner, batch_size, cap, dry_run, interactive, failures)
+            elif pass_name == "triage":
+                entries = await _run_triage_pass(entries, owner, batch_size, dry_run, interactive, failures)
+            elif pass_name == "dedupe":
+                entries = await _run_dedupe_pass(entries, owner, batch_size, dry_run, interactive, failures)
+            elif pass_name == "tag_normalize":
+                entries = await _run_tag_normalize_pass(entries, owner, cap, protected, dry_run, interactive, failures)
+            elif pass_name == "reword":
+                entries = await _run_reword_pass(entries, owner, batch_size, dry_run, memory_vector, interactive, failures)
+            elif pass_name == "rescore":
+                entries = _run_rescore_pass(entries, owner, dry_run)
+            elif pass_name == "expire":
+                entries = _run_expire_pass(entries, owner, protected, expiry_days, dry_run)
+            elif pass_name == "context_doc":
+                await _run_context_doc_pass(owner, entries, cap, protected, dry_run, interactive, failures)
+            if not dry_run:
+                # Write-ahead ordering: a completed pass's mutations MUST be on
+                # disk before the checkpoint marks it done. curate() only ever
+                # persisted at the very end before this, so a crash in a later
+                # pass would advance the checkpoint (per-pass) yet lose every
+                # in-memory mutation — the resumed run then reloads the
+                # un-mutated store and SKIPS the "completed" pass, stranding
+                # entries (e.g. untriaged, generality=None, which the tags-only
+                # fingerprint short-circuit could then make permanent).
+                _persist(entries)
+                _save_checkpoint(owner, pass_name)
 
     after_count = len(entries)
 
@@ -1755,7 +1852,7 @@ async def curate(
         else:
             _save_tidy_state(_tidy_state_path(memory_manager), owner, _fingerprint_entries(entries))
 
-    return {
+    result = {
         "status": "dry_run" if dry_run else "done",
         "before": before_count,
         "after": after_count,
@@ -1763,6 +1860,14 @@ async def curate(
         "had_failures": bool(failures),
         "failure_count": len(failures),
     }
+    if preview is not None:
+        # Proposal order is pass order (tag_backfill -> ... -> expire), which
+        # is the order the changes would actually be applied in — deliberately
+        # not reversed to newest-first like the history feed.
+        result["proposed_actions"] = preview["actions"]
+        result["proposed_total"] = preview["total"]
+        result["proposed_truncated"] = preview["total"] > len(preview["actions"])
+    return result
 
 
 async def triage_new_entries(memory_manager, owner: Optional[str] = None) -> Dict:

@@ -183,6 +183,13 @@ DEFAULT_SETTINGS = {
     "memory_curator_hour": 3,
     # Max entries per curator LLM sub-pass batch (never the whole store at once).
     "memory_curator_batch": 25,
+    # Max proposed actions a dry run returns inline for the Curator tab's
+    # preview (the changelog on disk is never capped). A first run over a
+    # large store across several passes can propose a lot; this response is
+    # assembled in memory inside the request. No UI control — a safety valve,
+    # not a knob: past a couple of hundred rows the preview stops being
+    # readable anyway, and the count summary still reports the true total.
+    "memory_curator_preview_cap": 200,
     # Default retrieval effort ("low" | "medium" | "high"); per-turn UI selector overrides it.
     "memory_retrieval_effort": "medium",
     # Max searched memories injected into the chat preface per turn (1-5).

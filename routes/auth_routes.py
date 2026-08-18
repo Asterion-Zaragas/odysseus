@@ -712,6 +712,7 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
             "memory_tag_registry_cap": (5, 500),
             "memory_curator_hour": (0, 23),
             "memory_curator_batch": (1, 200),
+            "memory_curator_preview_cap": (0, 5000),
             "memory_recall_k": (1, 5),
             "memory_archive_expiry_days": (1, 3650),
             "memory_curator_quarantine_after": (1, 50),
